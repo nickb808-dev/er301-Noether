@@ -8,7 +8,7 @@ speed from -2x to +2x, 0 = stopped, negative = reverse, pitch following speed.
 
 Unit title: **Noether** · mnemonic **Nt** · stereo · current version **0.7.2**
 
-Named for Emmy Noether. Sibling to Dirac, Planck, Bohr and Landau.
+Named for Emmy Noether. Sibling to Dirac and Landau.
 
 ---
 
