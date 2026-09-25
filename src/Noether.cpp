@@ -21,10 +21,12 @@ Noether::Noether(int channelCount)
     addOutput(mLeftOut);
     addOutput(mRightOut);
     addInput(mRecIn);
+    addInput(mStopIn);
+    addInput(mUndoIn);
+    addInput(mClkIn);
+    addOption(mSyncOpt);
     addInput(mSpeedIn);
     addInput(mVoctIn);
-    addInput(mStartIn);
-    addInput(mLenIn);
     addInput(mExtIn);
     addInput(mSosIn);
     addInput(mDryIn);
@@ -35,9 +37,28 @@ Noether::Noether(int channelCount)
     mRecStep = 1.0f / ((float)kSampleRate * kRecRampSec);
     mDryA    = 1.0f - expf(-1.0f / ((float)kSampleRate * kRecRampSec));
     mLn2Voct = 0.69314718f * kVoctOct;
+    // the fade table (see the header): a falling smoothstep
+    for (int k = 0; k <= kJump; ++k) {
+        const float t = (float)k / (float)kJump;
+        mXfade[k] = 1.0f - t * t * (3.0f - 2.0f * t);
+    }
+    // the undo bitmap: one bit per frame for the largest buffer the menu
+    // offers, allocated ONCE here (standard §3: never resize under the
+    // audio thread; 60 s = 360 kB)
+    mBitsFrames = kUndoMaxSecs * kSampleRate;
+    const size_t words = (size_t)(mBitsFrames / 32) + 1;
+    // plain operator new / delete (NOT new[]): those two symbols are already
+    // what the SWIG wrapper needs from the firmware; operator new[] is not
+    // in the firmware's export list and would fail the load silently
+    mBits = (uint32_t *)::operator new(words * sizeof(uint32_t));
+    memset(mBits, 0, words * sizeof(uint32_t));
 }
 
-Noether::~Noether() {}
+Noether::~Noether()
+{
+    if (mpUndo) mpUndo->release();
+    ::operator delete(mBits);
+}
 
 /* ── Lua-callable API ──────────────────────────────────────────────────── */
 
@@ -55,7 +76,90 @@ void Noether::setSample(od::Sample *sample)
 }
 
 void Noether::clearLoop()          { mClearRequested = true; }
-int   Noether::getState()          { return (int)mState; }
+void Noether::zeroBuffer()         { if (mpSample) mpSample->zero(); }
+int   Noether::isRestoring()       { return mRestoring ? 1 : 0; }
+int   Noether::canUndo()           { return (mUndoAvail && mpUndo) ? 1 : 0; }
+
+// UI thread, the od::Head::setSample order: publish nothing mid-swap.
+void Noether::setUndoSample(od::Sample *sample)
+{
+    od::Sample *p = mpUndo;
+    mpUndo = 0;
+    mRestoring = false;
+    clearUndo();
+    if (p) p->release();
+    p = sample;
+    if (p) p->attach();
+    mpUndo = p;
+}
+
+void Noether::clearUndo()
+{
+    if (mBits && mBitsFrames > 0) memset(mBits, 0, ((size_t)(mBitsFrames / 32) + 1) * sizeof(uint32_t));
+    mUndoAvail = false;
+    mUndoLenA = mUndoLenB = 0;
+}
+
+// A new pass (overdub in, extend): the previous pass can no longer be undone.
+void Noether::beginPass()
+{
+    if (mRestoring) return;
+    clearUndo();
+    mUndoLenA = mLoopLen;
+    mUndoLenB = mLoopLen;
+}
+
+// The Undo edge. Swaps loop <-> undo for every marked frame, spread over
+// the following blocks starting at the head and moving with it; swaps the
+// two lengths; a second edge swaps everything back (redo).
+void Noether::beginUndo()
+{
+    if (!mpUndo || !mUndoAvail || mRestoring || mLoopLen <= 0) return;
+    if (mState == OVERDUB) { mRecGoal = 0.0f; mRecLvl = 0.0f; mState = PLAY; }
+    mRestoring = true;
+    // the frames to visit: the longer of the two lengths (an extend's new
+    // material sits above the shorter one)
+    int span = mUndoLenA > mUndoLenB ? mUndoLenA : mUndoLenB;
+    if (span > mBitsFrames) span = mBitsFrames;
+    if (span > mCap) span = mCap;
+    mRestLeft = span;
+    mRestDir = (mSpeedZ < 0.0f) ? -1 : 1;
+    int p = mVizPos; if (p < 0) p = 0; if (p >= span) p = 0;
+    mRestPos = p;
+    // the length swap happens now; the window re-latches at the next wrap
+    const int newLen = (mLoopLen == mUndoLenA) ? mUndoLenB : mUndoLenA;
+    if (newLen > 0 && newLen <= mCap) {
+        mLoopLen = newLen;
+            if (mRead >= (double)newLen) mRead = 0.0;
+        mJumpCount = 0;
+    }
+    ++mLoopRev;
+}
+
+void Noether::restoreSome(float *d)
+{
+    if (!mRestoring) return;
+    float *u = mpUndo ? mpUndo->mpData : 0;
+    if (!u) { mRestoring = false; return; }
+    const int span = mUndoLenA > mUndoLenB ? mUndoLenA : mUndoLenB;
+    const int nc = mNc;
+    int n = kRestorePerBlock;
+    while (n > 0 && mRestLeft > 0) {
+        const int i = mRestPos;
+        if (i >= 0 && i < mBitsFrames && (uint32_t)i < mpUndo->mSampleCount && i < mCap && bitGet(i)) {
+            float *a = d + (size_t)i * nc;
+            float *b = u + (size_t)i * nc;
+            float t = a[0]; a[0] = b[0]; b[0] = t;
+            if (nc > 1) { t = a[1]; a[1] = b[1]; b[1] = t; }
+        }
+        mRestPos += mRestDir;
+        if (mRestPos >= span) mRestPos = 0;
+        if (mRestPos < 0) mRestPos = span - 1;
+        --mRestLeft; --n;
+    }
+    if (mRestLeft <= 0) { mRestoring = false; ++mLoopRev; if (mpSample) mpSample->setDirty(); }
+}
+int   Noether::getState()          { return (mState == PLAY && mStopped && mPlayLvl <= 0.0f) ? (int)STOP : (int)mState; }
 int   Noether::getLoopSamples()    { return mLoopLen; }
 float Noether::getLoopSeconds()    { return (float)mLoopLen * (1.0f / (float)kSampleRate); }
 float Noether::getSpeed()          { return mSpeedZ; }
@@ -63,9 +167,59 @@ void  Noether::setSeamMatch(int on){ mSeamMatch = (on != 0); }
 int   Noether::getSeamMatch()      { return mSeamMatch ? 1 : 0; }
 int   Noether::getLoopRev()        { return mLoopRev; }
 int   Noether::getDetent()         { return mDetent ? 1 : 0; }
-int   Noether::getSections()       { return kSections; }
-int   Noether::getWindowStart()    { return mWinStart; }
-int   Noether::getWindowLength()   { return mWinLen > 0 ? mWinLen : mLoopLen; }
+int   Noether::getSections()       { return (mSyncN > 0 && mSyncOpt.value() == 2) ? mSyncN : kSections; }
+void  Noether::setSyncN(int n)     { mSyncN = (n > 0 && n < 1024) ? n : 0; mEdgePhase = 0; }
+int   Noether::getSyncN()          { return mSyncN; }
+int   Noether::isArmed()           { return mArmed; }
+int   Noether::hasClock()          { return mClkSince < kClkTimeout ? 1 : 0; }
+
+// A clock edge, at its sample. Free mode: restart the loop (a reset
+// trigger). Sync mode: start / stop an armed take, and every N-th edge pull
+// the head back to the seam so the loop stays on the downbeat at any speed.
+void Noether::onClockEdge()
+{
+    const bool sync = mSyncOpt.value() == 2;
+    if (mClkSince >= kClkMinPeriod && mClkSince < kClkTimeout) mClkPeriod = mClkSince;
+    mClkSince = 0;
+    ++mClkCount;
+
+    if (!sync) {
+        // a reset: restart the loop from the seam — unless the head is
+        // already within kSyncTol of it, so a loop in time with its clock
+        // never retriggers itself
+        if (mState == PLAY || mState == OVERDUB) {
+            const int L = mLoopLen;
+            if (L > 0 && !(mRead < (double)kSyncTol || mRead > (double)(L - kSyncTol)))
+                beginJump(0.0, mRead);
+        }
+        return;
+    }
+    if (mArmed == 1 && mState == EMPTY) {
+        enterRecord();
+        mClkAtStart = mClkCount;
+        mArmed = 0;
+        return;
+    }
+    if (mArmed == 2 && mState == RECORD) {
+        mSyncN = mClkCount - mClkAtStart;
+        if (mSyncN < 1) mSyncN = 1;
+        mWrite = (mWrite < 1) ? 1 : mWrite;
+        closeLoopExact();                    // the clock dictates the length
+        if (mState == RECORD) enterPlay();
+        mArmed = 0;
+        mEdgePhase = 0;                      // this edge IS the downbeat
+        return;
+    }
+    if ((mState == PLAY || mState == OVERDUB) && mSyncN > 0) {
+        ++mEdgePhase;
+        if (mEdgePhase >= mSyncN) {          // the N-th edge: the downbeat
+            mEdgePhase = 0;
+            const int L = mLoopLen;
+            if (L > 0 && !(mRead < (double)kSyncTol || mRead > (double)(L - kSyncTol)))
+                beginJump(0.0, mRead);
+        }
+    }
+}
 
 // UI thread. Copies the loop [0, L) into dst; dst was allocated by Lua with
 // at least L frames (standard §3: never resize here). Channel-mapped.
@@ -92,17 +246,25 @@ int Noether::exportLoop(od::Sample *dst)
 
 // UI thread. The audio thread is told EMPTY first (its EMPTY path never
 // touches the buffer), the copy runs, then the loop is published.
+// Returns the frames imported, or a NEGATIVE reason (shown on the menu's
+// status line): -1 no source / no source data, -2 no loop buffer,
+// -3 channel count, -4 fewer than 4 frames available. Lua only calls this
+// once the pool has reported the file complete, so when the file's
+// "loaded" counter is 0 but its frame count is not (a completed card load
+// that never touched mSampleLoadCount) the frame count is trusted.
 int Noether::importLoop(od::Sample *src)
 {
     od::Sample *dst = mpSample;
-    if (!src || !src->mpData || !dst || !dst->mpData) return 0;
+    if (!src || !src->mpData) return -1;
+    if (!dst || !dst->mpData) return -2;
     uint32_t avail = src->mSampleLoadCount < src->mSampleCount ? src->mSampleLoadCount : src->mSampleCount;
+    if (avail == 0) avail = src->mSampleCount;
     const int ns = (int)src->mChannelCount, nd = (int)dst->mChannelCount;
-    if (ns < 1 || ns > kMaxCh || nd < 1 || nd > kMaxCh) return 0;
+    if (ns < 1 || ns > kMaxCh || nd < 1 || nd > kMaxCh) return -3;
     int n = (int)avail;
     uint32_t cap = dst->mSampleLoadCount < dst->mSampleCount ? dst->mSampleLoadCount : dst->mSampleCount;
     if ((uint32_t)n > cap) n = (int)cap;
-    if (n < 4) return 0;
+    if (n < 4) return -4;
 
     enterEmpty();                       // audio thread now ignores the buffer
     for (int i = 0; i < n; ++i) {
@@ -114,7 +276,6 @@ int Noether::importLoop(od::Sample *src)
     mNc = nd;
     mCap = (int)cap;
     mLoopLen = n;
-    mWinStart = 0; mWinLen = 0;
     mRead = 0.0; mJumpCount = 0;
     ++mLoopRev;
     dst->setDirty();
@@ -126,10 +287,13 @@ int Noether::importLoop(od::Sample *src)
 
 void Noether::enterEmpty()
 {
+    mArmed = 0;
+    clearUndo();
+    mRestoring = false;
+    mTailLeft = 0; mFirstTake = false;
     mState = EMPTY;
     if (mLoopLen > 0) ++mLoopRev;
     mLoopLen = 0;
-    mWinStart = 0; mWinLen = 0;
     mWrite = 0;
     mRead = 0.0;
     mJumpCount = 0;
@@ -138,10 +302,11 @@ void Noether::enterEmpty()
 
 void Noether::enterRecord()
 {
+    clearUndo();
+    mTailLeft = 0; mFirstTake = false;
     mState = RECORD;
     mWrite = 0;
     mLoopLen = 0;
-    mWinStart = 0; mWinLen = 0;
     mRead = 0.0;
     mJumpCount = 0;
     mRecLvl = mRecGoal = 1.0f;   // first take: full level, no ramp — the seam
@@ -162,7 +327,6 @@ void Noether::closeLoop()
     od::Sample *s = mpSample;
     if (!s || !s->mpData || mCap <= 0) { enterEmpty(); return; }
     float *d = s->mpData;
-    const int nc = mNc;
     int len = mWrite;
     if (len > mCap) len = mCap;
     if (len < 4) { enterEmpty(); return; }
@@ -177,19 +341,11 @@ void Noether::closeLoop()
         // The cut: where REC was pressed (less the crossfade tail), or the
         // phase-matched point up to kSeamSearch samples earlier.
         int L = len - kSeam;
-        if (mSeamMatch && len > 2 * (kSeamSearch + kMatchWin)) {
+        if (mSeamMatch && len > 2 * kMatchWin + kSeam + 8) {
             L = findSeam(d, len - (kSeam > kMatchWin ? kSeam : kMatchWin));
         }
 #endif
-        const float inv = 1.0f / (float)kSeam;
-        for (int k = 0; k < kSeam; ++k) {
-            const float t = ((float)k + 0.5f) * inv;
-            const float w = t * t * (3.0f - 2.0f * t);   // head fade-in
-            float *h = d + (size_t)k * nc;
-            const float *tl = d + (size_t)(L + k) * nc;
-            for (int c = 0; c < nc; ++c)
-                h[c] = h[c] * w + tl[c] * (1.0f - w);
-        }
+        blendSeam(d, L);
         mLoopLen = L;
     } else {
         mLoopLen = len;
@@ -198,72 +354,144 @@ void Noether::closeLoop()
     // the tail — i.e. exactly where the recording would have continued.
     mRead = 0.0;
     mJumpCount = 0;
-    mWinStart = 0; mWinLen = 0;
+    ++mLoopRev;
+    s->setDirty();
+}
+
+// The seam itself: crossfade buf[L..L+kSeam) INTO buf[0..kSeam), so the
+// sample after the loop's last one is what was recorded next.
+void Noether::blendSeam(float *d, int L)
+{
+    const int nc = mNc;
+    const float inv = 1.0f / (float)kSeam;
+    for (int k = 0; k < kSeam; ++k) {
+        const float t = ((float)k + 0.5f) * inv;
+        const float w = t * t * (3.0f - 2.0f * t);   // head fade-in
+        cow(d, k);
+        float *h = d + (size_t)k * nc;
+        const float *tl = d + (size_t)(L + k) * nc;
+        for (int c = 0; c < nc; ++c)
+            h[c] = h[c] * w + tl[c] * (1.0f - w);
+    }
+}
+
+// A clocked close: the loop is EXACTLY mWrite frames (the clock's length),
+// playback starts now, and the next kSeam input frames are still captured
+// as the tail (mTailLeft) so the seam can be blended without shortening.
+void Noether::closeLoopExact()
+{
+    od::Sample *s = mpSample;
+    if (!s || !s->mpData || mCap <= 0) { enterEmpty(); return; }
+    int len = mWrite;
+    if (len > mCap - kSeam - 1) len = mCap - kSeam - 1;
+    if (len < 4) { enterEmpty(); return; }
+    mLoopLen = len;
+    mTailLeft = kSeam;
+    mFirstTake = true;
+    mRead = 0.0;
+    mJumpCount = 0;
     ++mLoopRev;
     s->setDirty();
 }
 
 // Least-squared-difference match of buf[L..L+kMatchWin) against the head
-// buf[0..kMatchWin), L in [hi - kSeamSearch, hi]. Coarse pass at stride 8,
-// fine pass +/-8, both on the FULL window: a half-window coarse pass was
-// tried first and tied on the flat top of a pulse wave (host `pulse` test),
-// choosing a cut 107 samples off the period. Ties (silence, DC) keep the
-// LATEST L, so an unmatched cut is as close as possible to where REC was
-// pressed. One-shot at loop close: ~80k multiply-adds stereo, no divides,
-// no allocation. The window bounds what can be matched: a period longer
-// than kMatchWin (below ~94 Hz for a pulse) may tie on its flat regions.
+// buf[0..kMatchWin), L in [hi - kSeamSearch, hi]. Coarse pass at stride 8
+// comparing every kMatchDec-th frame of the FULL window (a half-window pass
+// was tried first and tied on the flat top of a pulse wave — host `pulse`
+// test; decimation keeps the window's extent so an edge always lands in
+// it), then a fine pass +/-8 on every frame. The search reaches back 43 ms
+// so one full period of anything down to 23 Hz fits: 0.7.1, after Nick heard
+// a bass triangle kink at the seam with the old 10.7 ms reach. Among the
+// coarse candidates the LATEST one within a small margin of the best error
+// wins, so a periodic signal is cut one period back, not four — the loop
+// stays as close as possible to where REC was pressed; ties (silence, DC)
+// likewise keep the latest. One-shot at loop close: ~170k multiply-adds
+// stereo, no divides, no allocation.
 int Noether::findSeam(const float *d, int hi) const
 {
     const int nc = mNc;
-    const int lo = hi - kSeamSearch;
-    if (lo < kMatchWin) return hi;
+    // The reach is clamped so the tail window never overlaps the head window
+    // (short loops still match, over what room there is).
+    int lo = hi - kSeamSearch;
+    if (lo < kMatchWin) lo = kMatchWin;
+    if (lo > hi) return hi;
     const float *head = d;
-    const int n = kMatchWin * nc;
+    const int n  = kMatchWin * nc;
+    const int dn = kMatchDec * nc;
 
-    int   bestL = hi;
+    // coarse errors, index i <-> L = hi - 8 i
+    constexpr int kMaxN = kSeamSearch / 8 + 1;
+    float ce[kMaxN];
+    const int kN = (hi - lo) / 8 + 1;
+    int   bestI = 0;
     float bestE = 3.0e38f;
-    for (int L = hi; L >= lo; L -= 8) {
-        const float *t = d + (size_t)L * nc;
+    for (int i = 0; i < kN; ++i) {
+        const float *t = d + (size_t)(hi - 8 * i) * nc;
         float e = 0.0f;
-        for (int k = 0; k < n; ++k) { const float df = t[k] - head[k]; e += df * df; }
-        if (e < bestE) { bestE = e; bestL = L; }
+        for (int k = 0; k < n; k += dn)
+            for (int c = 0; c < nc; ++c) { const float df = t[k + c] - head[k + c]; e += df * df; }
+        ce[i] = e;
+        if (e < bestE) { bestE = e; bestI = i; }
     }
-    const int c = bestL;
-    bestE = 3.0e38f;
-    for (int L = c + 8; L >= c - 8; --L) {
-        if (L > hi || L < lo) continue;
-        const float *t = d + (size_t)L * nc;
-        float e = 0.0f;
-        for (int k = 0; k < n; ++k) { const float df = t[k] - head[k]; e += df * df; }
-        if (e < bestE) { bestE = e; bestL = L; }
+
+    // Fine pass (+/-8, every frame) around a coarse candidate.
+    auto fine = [&](int c0, float &eOut) {
+        int   bL = c0;
+        float bE = 3.0e38f;
+        for (int L = c0 + 8; L >= c0 - 8; --L) {
+            if (L > hi || L < lo) continue;
+            const float *t = d + (size_t)L * nc;
+            float e = 0.0f;
+            for (int k = 0; k < n; ++k) { const float df = t[k] - head[k]; e += df * df; }
+            if (e < bE) { bE = e; bL = L; }
+        }
+        eOut = bE;
+        return bL;
+    };
+
+    float eBest;
+    int   LBest = fine(hi - 8 * bestI, eBest);
+    // "About as good": within 25 % of the best, or a residual 25 dB below
+    // the head's energy (a non-integer period puts the integer-sample best
+    // several periods back; the nearest period is a hair worse and just as
+    // inaudible after the blend).
+    float energy = 0.0f;
+    for (int k = 0; k < n; ++k) energy += head[k] * head[k];
+    float margin = eBest * 1.25f + 1.0e-9f;
+    const float floorE = energy * 0.003f;
+    if (floorE > margin) margin = floorE;
+
+    // The latest coarse LOCAL minimum that fine-tunes to within the margin
+    // wins (at most a few fine passes, bounded for noise-like material).
+    int passes = 0;
+    for (int i = 0; i < bestI && passes < 4; ++i) {
+        const bool localMin = (i == 0 || ce[i] <= ce[i - 1]) && (i + 1 >= kN || ce[i] <= ce[i + 1]);
+        if (!localMin) continue;
+        float e;
+        const int L = fine(hi - 8 * i, e);
+        ++passes;
+        if (e <= margin) return L;
     }
-    return bestL;
+    return LBest;
 }
 
 // Jump the read head to a window phase while a shadow head (absolute loop
 // position) keeps playing from where it was and fades out over kSeam.
+// A jump of the read head: the new position ramps in over kJumpIn while a
+// shadow head keeps playing the old material and tails out over kJumpOut
+// (capped at half the window so a short slice never hears its neighbour).
 void Noether::beginJump(double toWindowPhase, double shadowAbs)
 {
     mShadow = shadowAbs;
     mRead = toWindowPhase;
-    mJumpCount = kSeam;
-}
-
-// Window targets -> latched window. startS / lenS are loop-sample counts
-// derived from the Start / Len inlets. Returns true if the latched window
-// is anything but the whole loop.
-bool Noether::latchWindow(int startS, int lenS)
-{
-    const int L = mLoopLen;
-    if (L <= 0) { mWinStart = 0; mWinLen = 0; return false; }
-    if (lenS >= L && startS <= 0) { mWinStart = 0; mWinLen = 0; return false; }
-    if (lenS < kMinWindow) lenS = kMinWindow;
-    if (lenS > L) lenS = L;
-    if (startS < 0) startS = 0;
-    if (startS >= L) startS = L - 1;
-    mWinStart = startS;
-    mWinLen = lenS;
-    return true;
+    int out = kJumpOut;
+    if (mLoopLen > 0 && out > mLoopLen / 2) out = mLoopLen / 2;
+    if (out < kJumpIn) out = kJumpIn;
+    int in = kJumpIn;
+    if (in > out) in = out;
+    mJumpCount = out;
+    mOutPh = 0.0f; mOutStep = (float)kJump / (float)out;
+    mInPh  = 0.0f; mInStep  = (float)kJump / (float)in;
 }
 
 // End of an EXTEND: the write head is the new end of the loop. Same seam
@@ -272,6 +500,8 @@ void Noether::closeExtend()
 {
     closeLoop();
     if (mState == EXTEND) { mState = PLAY; mRecGoal = 0.0f; mRecLvl = 0.0f; }
+    mUndoLenB = mLoopLen;
+    mUndoAvail = true;
 }
 
 /* ── reads ─────────────────────────────────────────────────────────────── */
@@ -351,32 +581,33 @@ void Noether::process()
     const float sos    = clampf(sanitize(mSosIn.buffer()[0]), 0.0f, 1.0f);
     const float dry    = clampf(sanitize(mDryIn.buffer()[0]), 0.0f, 1.0f);
     const float level  = clampf(sanitize(mLevelIn.buffer()[0]), 0.0f, 1.0f);
-    const float startN = clampf(sanitize(mStartIn.buffer()[0]), 0.0f, 1.0f);
-    const float lenN   = clampf(sanitize(mLenIn.buffer()[0]), 0.0f, 1.0f);
     const bool  extend = sanitize(mExtIn.buffer()[0]) > 0.5f;
+    const bool  stopGate = sanitize(mStopIn.buffer()[0]) > 0.5f;
+    const float *undo = mUndoIn.buffer();
+    const float *clk  = mClkIn.buffer();
+    const bool  syncMode = mSyncOpt.value() == 2;
+    const bool  clockPresent = mClkSince < kClkTimeout;
+    if (!clockPresent) mArmed = 0;    // the clock went away: never a dead REC button
+    const float playStep = mRecStep;   // 5 ms, same ramp as record
     const float aGlide = mGlideA;
     const float recStep = mRecStep;
     const float aDry    = mDryA;
     const float *rec = mRecIn.buffer();
-    const float jumpInv = 1.0f / (float)kSeam;
     // window targets in loop samples (latched at the next wrap)
-    const int   winStartT = (int)(startN * (float)mLoopLen + 0.5f);
-    const int   winLenT   = (lenN >= 0.999f) ? mLoopLen : (int)(lenN * (float)mLoopLen + 0.5f);
 
     if (!mInit) { mSpeedZ = speedT; mInit = true; }
     // sticky-NaN guards (positive tests, standard §5)
     if (!(mSpeedZ >= -kSpeedMax && mSpeedZ <= kSpeedMax)) mSpeedZ = speedT;
-    {
-        const int wl = mWinLen > 0 ? mWinLen : (mLoopLen > 0 ? mLoopLen : 1);
-        if (!(mRead >= 0.0 && mRead < (double)wl)) mRead = 0.0;
-        if (!(mShadow >= 0.0 && mShadow < (double)(mLoopLen > 0 ? mLoopLen : 1))) { mShadow = 0.0; mJumpCount = 0; }
-    }
+    if (!(mRead >= 0.0 && mRead < (double)(mLoopLen > 0 ? mLoopLen : 1))) mRead = 0.0;
+    if (!(mShadow >= 0.0 && mShadow < (double)(mLoopLen > 0 ? mLoopLen : 1))) { mShadow = 0.0; mJumpCount = 0; }
     if (!(mRecLvl >= 0.0f && mRecLvl <= 1.0f)) mRecLvl = mRecGoal;
     if (!(mDryZ >= 0.0f && mDryZ <= 1.0f)) mDryZ = dry;
     if (!(mAaL > -8.0f && mAaL < 8.0f)) mAaL = 0.0f;
     if (!(mAaR > -8.0f && mAaR < 8.0f)) mAaR = 0.0f;
 
-    float prevRec = mPrevRec;
+    float prevRec = mPrevRec, prevUndo = mPrevUndo, prevClk = mPrevClk;
+    mStopped = stopGate;
+    if (mRestoring) restoreSome(d);
 
     for (int i = 0; i < N; ++i) {
         const float xl = sanitize(inL[i]);
@@ -386,23 +617,44 @@ void Noether::process()
         const float r = rec[i];
         if (r > 0.5f && prevRec <= 0.5f) {
             switch (mState) {
-            case EMPTY:   enterRecord(); break;
-            case RECORD:  mWrite = (mWrite < 1) ? 1 : mWrite;  // at least one frame
+            case EMPTY:   if (syncMode && clockPresent) { mArmed = 1; mClkAtStart = mClkCount; }
+                          else { mArmed = 0; enterRecord(); }
+                          break;
+            case RECORD:  if (syncMode && clockPresent) { mArmed = 2; break; }   // stop on the next edge
+                          mArmed = 0;
+                          mWrite = (mWrite < 1) ? 1 : mWrite;  // at least one frame
+                          mSyncN = 0;
                           closeLoop();
                           if (mState == RECORD) enterPlay();
                           break;
-            case PLAY:    mState = OVERDUB; mRecGoal = 1.0f; break;
+            case PLAY:    if (!mRestoring && !(mStopped && mPlayLvl <= 0.0f)) { beginPass(); mState = OVERDUB; mRecGoal = 1.0f; } break;
             case OVERDUB: mRecGoal = 0.0f; break;   // ramp out, then PLAY
             case EXTEND:  closeExtend(); break;
             case STOP:    break;
             }
         }
         prevRec = r;
+        // ── CLOCK edge ──
+        const float ce = clk[i];
+        if (ce > 0.5f && prevClk <= 0.5f) onClockEdge();
+        prevClk = ce;
+        if (mClkSince < (1 << 30)) ++mClkSince;
+        // ── UNDO edge ──
+        const float ue = undo[i];
+        if (ue > 0.5f && prevUndo <= 0.5f) {
+            if (mState == EXTEND) closeExtend();
+            if (mState == PLAY || mState == OVERDUB) beginUndo();
+        }
+        prevUndo = ue;
+        // ── transport ramp ──
+        if (mStopped) { if (mPlayLvl > 0.0f) { mPlayLvl -= playStep; if (mPlayLvl < 0.0f) mPlayLvl = 0.0f; } }
+        else          { if (mPlayLvl < 1.0f) { mPlayLvl += playStep; if (mPlayLvl > 1.0f) mPlayLvl = 1.0f; } }
+        const bool held = mStopped && mPlayLvl <= 0.0f;
 
         // ── record level ramp ──
         if (mRecLvl < mRecGoal) { mRecLvl += recStep; if (mRecLvl > mRecGoal) mRecLvl = mRecGoal; }
         else if (mRecLvl > mRecGoal) { mRecLvl -= recStep; if (mRecLvl < mRecGoal) mRecLvl = mRecGoal; }
-        if (mState == OVERDUB && mRecGoal == 0.0f && mRecLvl == 0.0f) { mState = PLAY; ++mLoopRev; }
+        if (mState == OVERDUB && mRecGoal == 0.0f && mRecLvl == 0.0f) { mState = PLAY; ++mLoopRev; mUndoLenB = mLoopLen; }
 
         // ── speed glide ──
         mSpeedZ += aGlide * (speedT - mSpeedZ);
@@ -433,6 +685,7 @@ void Noether::process()
             float *w = d + (size_t)mWrite * mNc;
             const float sl = src[0];
             const float sr = (mNc > 1) ? src[1] : sl;
+            cow(d, mWrite);
             w[0] = softLimit(sos * sl + (1.0f - sos) * xl);
             if (mNc > 1) w[1] = softLimit(sos * sr + (1.0f - sos) * xr);
             ++mWrite;
@@ -450,19 +703,25 @@ void Noether::process()
         case OVERDUB: {
             const int L = mLoopLen;
             if (L <= 0) { outL[i] = xl; outR[i] = xr; continue; }
-            const bool windowed = (mWinLen > 0);
-            const int  wl = windowed ? mWinLen : L;
-
+            // a clocked close still captures kSeam frames of tail, then blends
+            if (mTailLeft > 0 && mWrite < mCap) {
+                float *w = d + (size_t)mWrite * mNc;
+                w[0] = xl;
+                if (mNc > 1) w[1] = xr;
+                ++mWrite;
+                if (--mTailLeft == 0) { blendSeam(d, L); mFirstTake = false; ++mLoopRev; }
+            }
             // absolute loop position of the read head
-            double pos = mRead + (double)mWinStart;
+            double pos = mRead;
             if (pos >= (double)L) pos -= (double)L;
 
             // overdub write at the read head (nearest sample), blended by the
             // record ramp so punching in/out never steps the existing audio
-            if (mState == OVERDUB && mRecLvl > 0.0f &&
+            if (mState == OVERDUB && mRecLvl > 0.0f && !held &&
                 (mSpeedZ > kSpeedStop || mSpeedZ < -kSpeedStop)) {
                 int wi = (int)(pos + 0.5);
                 if (wi >= L) wi -= L;
+                cow(d, wi);
                 float *w = d + (size_t)wi * mNc;
                 const float g = mRecLvl;
                 float nl = sos * w[0] + (1.0f - sos) * xl;
@@ -476,11 +735,15 @@ void Noether::process()
             yl = readHermite(d, pos, 0);
             yr = (mNc > 1) ? readHermite(d, pos, 1) : yl;
             if (mJumpCount > 0) {
-                const float wj = (float)mJumpCount * jumpInv;   // shadow weight
+                int ko = (int)mOutPh; if (ko > kJump) ko = kJump; if (ko < 0) ko = 0;
+                int ki = (int)mInPh;  if (ki > kJump) ki = kJump; if (ki < 0) ki = 0;
+                mOutPh += mOutStep; mInPh += mInStep;
+                const float wOut = mXfade[ko];                 // old material, tailing out
+                const float wIn  = 1.0f - mXfade[ki];          // new position, ramping in (1 ms)
                 float sl = readHermite(d, mShadow, 0);
                 float sr = (mNc > 1) ? readHermite(d, mShadow, 1) : sl;
-                yl += (sl - yl) * wj;
-                yr += (sr - yr) * wj;
+                yl = yl * wIn + sl * wOut;
+                yr = yr * wIn + sr * wOut;
                 mShadow += (double)mSpeedZ;
                 if (mShadow >= (double)L) mShadow -= (double)L;
                 if (mShadow < 0.0)        mShadow += (double)L;
@@ -492,30 +755,21 @@ void Noether::process()
                 mAaR += aAa * (yr - mAaR); yr = mAaR;
             } else { mAaL = yl; mAaR = yr; }
 
-            // advance, and handle the wrap
+            // advance (unless the transport holds), and handle the wrap
+            if (held) break;
             mRead += (double)mSpeedZ;
-            if (mRead >= (double)wl || mRead < 0.0) {
-                const bool fwd = mRead >= (double)wl;
-                // EXTEND: an overdub with the ext gate on runs off the end of
-                // the whole loop at forward speed and keeps recording
-                if (fwd && mState == OVERDUB && extend && !windowed && mRecGoal > 0.0f) {
+            if (mRead >= (double)L || mRead < 0.0) {
+                const bool fwd = mRead >= (double)L;
+                // EXTEND: an overdub with the ext gate on runs off the end
+                // at forward speed and keeps recording
+                if (fwd && mState == OVERDUB && extend && mRecGoal > 0.0f) {
                     mLoop0 = L;
                     mWrite = L;
                     if (mWrite < mCap) { mState = EXTEND; ++mLoopRev; break; }
                 }
-                // where the head would have continued (for the shadow)
-                double cont = pos + (double)mSpeedZ;
-                if (cont >= (double)L) cont -= (double)L;
-                if (cont < 0.0)        cont += (double)L;
-                // latch the window targets, then place the head
-                const bool wasWindowed = windowed;
-                const bool nowWindowed = latchWindow(winStartT, winLenT);
-                const int  nwl = nowWindowed ? mWinLen : L;
-                double ph;
-                if (fwd) { ph = mRead - (double)wl; if (ph >= (double)nwl || ph < 0.0) ph = 0.0; }
-                else     { ph = mRead + (double)nwl; if (ph < 0.0 || ph >= (double)nwl) ph = (double)nwl - 1.0; }
-                if (wasWindowed || nowWindowed) beginJump(ph, cont);   // a window edge is a jump
-                else mRead = ph;                                       // the whole loop: the natural seam
+                // the natural seam: buf[L] is buf[0] after the blend
+                if (fwd) { mRead -= (double)L; if (mRead >= (double)L || mRead < 0.0) mRead = 0.0; }
+                else     { mRead += (double)L; if (mRead < 0.0 || mRead >= (double)L) mRead = (double)L - 1.0; }
             }
             break;
         }
@@ -531,11 +785,11 @@ void Noether::process()
         // steps the dry signal.
         const float dryT = (mState == OVERDUB) ? 1.0f : dry;
         mDryZ += aDry * (dryT - mDryZ);
-        yl *= level; yr *= level;
+        yl *= level * mPlayLvl; yr *= level * mPlayLvl;
         outL[i] = xl * mDryZ + yl;
         outR[i] = xr * mDryZ + yr;
     }
-    mPrevRec = prevRec;
+    mPrevRec = prevRec; mPrevUndo = prevUndo; mPrevClk = prevClk;
 
     if (mState == RECORD || mState == OVERDUB || mState == EXTEND) s->setDirty();
     mCurrentIndex = (mState == RECORD || mState == EXTEND) ? mWrite : mVizPos;

@@ -52,11 +52,9 @@ public:
         }
         mLastWrite = w;
 
-        // the loop, or the window inside it when one is latched
+        // the loop is the marked region
         const int L = h->getLoopSamples();
-        const int ws = h->getWindowStart(), wl = h->getWindowLength();
-        int me = ws + wl; if (me > L) me = L;
-        mSampleView.setMarkedRegion(L > 0 ? ws : 0, L > 0 ? me : 0);
+        mSampleView.setMarkedRegion(0, L > 0 ? L : 0);
 
         od::HeadDisplay::draw(fb);
 

@@ -26,6 +26,7 @@ struct Sample {
     float    mSampleRate      = 48000.0f;
     bool     mDirty           = false;
     void setDirty() { mDirty = true; }
+    void zero() { if (mpData) for (uint32_t i = 0; i < mSampleCount * mChannelCount; ++i) mpData[i] = 0.0f; mDirty = true; }
 
     // Test helper: mark the buffer fully loaded (the SDK's setMemoryOnly()).
     void setMemoryOnly() { mSampleLoadCount = mSampleCount; }

@@ -2,12 +2,11 @@
  * SPDX-License-Identifier: Apache-2.0
  * Copyright 2026 Nicholas Breinich (nickb808) — see LICENSE and NOTICE.
  *
- * ONE glyph answers position, direction, speed, window, sections, state and
+ * ONE glyph answers position, direction, speed, sections, state and
  * content (standard §8: one space, layered):
  *   - the loop's amplitude envelope drawn in POLAR form: the ring's thickness
  *     at each angle is the loudness there; 12 o'clock is the seam, clockwise
  *     is forward;
- *   - the Start/Len window is the bright arc, the rest of the ring faint;
  *   - kSections radial ticks divide the loop; the section the head is in is
  *     drawn brightest;
  *   - the read head is a dot on the ring. Its COMET TAIL is the distance from
@@ -77,9 +76,14 @@ public:
         od::Sample *pSample = h->getSample();
         const int L = h->getLoopSamples();
 
+        ++mFrame;
+        const bool armed = h->isArmed() != 0;
+        const bool strobe = armed && ((mFrame >> 3) & 1);   // waiting for the clock: REC blinks
+
         if (state == Noether::EMPTY || !pSample || !pSample->mpData) {
             fb.circle(GRAY3, cx, cy, R);
-            fb.text(GRAY7, cx - 9, cy - 4, "rec", 10);
+            if (armed) { if (strobe) centerWord(fb, WHITE, cx, cy, "REC", 10); }
+            else centerWord(fb, GRAY7, cx, cy, "rec", 10);
             mEnvRev = -1;
             return;
         }
@@ -88,7 +92,7 @@ public:
             // winding on: an arc from 12 o'clock, one turn per kWindSamples,
             // each further turn one step outward
             drawWinding(fb, cx, cy, R, h->vizWrite(), kWindSamples, WHITE);
-            fb.text(WHITE, cx - 9, cy - 4, "REC", 10);
+            if (!armed || strobe) centerWord(fb, WHITE, cx, cy, "REC", 10);
             mEnvRev = -1;
             return;
         }
@@ -98,26 +102,14 @@ public:
         if (L0 <= 0) { fb.circle(GRAY3, cx, cy, R); return; }
         updateEnvelope(h, pSample, L0);
 
-        const int ws = h->getWindowStart();
-        int wl = h->getWindowLength(); if (wl <= 0 || wl > L0) wl = L0;
-        const bool windowed = (ws != 0 || wl != L0);
         const int sections = h->getSections() > 0 ? h->getSections() : 1;
         const int pos = h->vizPos();
         const int curSection = (int)((long)pos * sections / (L0 > 0 ? L0 : 1));
 
         for (int i = 0; i < kBins; ++i) {
             const int a = (i * kLutN) / kBins;
-            const int s0 = (int)((long)i * L0 / kBins);
-            bool inWin = true;
-            if (windowed) {
-                int rel = s0 - ws; if (rel < 0) rel += L0;
-                inWin = rel < wl;
-            }
             const int sec = (int)((long)i * sections / kBins);
-            int color;
-            if (!inWin) color = GRAY3;
-            else if (sec == curSection && state != Noether::EXTEND) color = WHITE;
-            else color = GRAY9;
+            const int color = (sec == curSection && state != Noether::EXTEND) ? WHITE : GRAY9;
             const float e = mEnv[i];
             const int r0 = R - 1;
             const int r1 = R + 1 + (int)(e * 5.0f + 0.5f);
@@ -133,7 +125,7 @@ public:
             // the new material winds on outside the finished loop
             const int w = h->vizWrite() - L0;
             drawWinding(fb, cx, cy, R + 6, w, L0, WHITE);
-            fb.text(WHITE, cx - 9, cy - 4, "EXT", 10);
+            centerWord(fb, WHITE, cx, cy, "EXT", 10);
             return;
         }
 
@@ -163,8 +155,10 @@ public:
         if (locked) { fb.circle(WHITE, hx, hy, 3); fb.pixel(WHITE, hx, hy); }
         else        { fb.fillCircle(WHITE, hx, hy, 2); }
 
-        if (state == Noether::OVERDUB) fb.text(WHITE, cx - 9, cy - 4, "DUB", 10);
-        else if (state == Noether::STOP) fb.text(GRAY9, cx - 11, cy - 4, "STOP", 10);
+        if (state == Noether::OVERDUB) centerWord(fb, WHITE, cx, cy, "DUB", 10);
+        else if (state == Noether::STOP) centerWord(fb, GRAY9, cx, cy, "STOP", 10);
+        else if (h->isRestoring())      centerWord(fb, WHITE, cx, cy, "undo", 10);
+        else if (h->canUndo())          centerWord(fb, GRAY5, cx, cy, "undo", 8);
     }
 
     // ── envelope: kBins peak bins over [0, L0), incremental ──
@@ -213,6 +207,28 @@ public:
         }
     }
 
+    // The word in the middle of the reel, truly centred: text() returns the
+    // width it drew, so the width from the previous frame centres this one
+    // (the first frame estimates 6 px per glyph); ALIGN_MIDDLE puts the
+    // glyph box's centre on cy (MainFrameBuffer: v = -height/2). Photographed
+    // at 0.5.0: a fixed offset sat visibly low and left in the ring.
+    void centerWord(od::FrameBuffer &fb, int color, int cx, int cy, const char *str, int size)
+    {
+        int n = 0; while (str[n]) ++n;
+        if (mWordSize != size || mWordLen != n) { mWordW = 0; mWordSize = size; mWordLen = n; }
+        const int w = mWordW > 0 ? mWordW : n * (size >= 10 ? 6 : 5);
+        const int x0 = cx - w / 2;
+        // text() returns the x position AFTER the last glyph (MainFrameBuffer:
+        // `return x` after advancing by xadvance per glyph), NOT a width.
+        // 0.5.1 cached that absolute x as if it were a width (floated while
+        // scrolling); 0.6.1 kept its maximum (the word left the ring). The
+        // width is end minus start, and the advance does not depend on
+        // clipping, so this is exact from the second frame on.
+        const int xEnd = fb.text(color, x0, cy, str, size, ALIGN_MIDDLE);
+        const int measured = xEnd - x0;
+        if (measured > 0 && measured < 4 * mWidth) mWordW = measured;
+    }
+
     // a radial line at LUT angle `a` (0 = 12 o'clock, clockwise) from r0 to r1
     static inline void radial(od::FrameBuffer &fb, int color, int cx, int cy, int a, int r0, int r1)
     {
@@ -250,6 +266,8 @@ public:
     float mEnv[kBins];
     unsigned char mDirty[kBins] = {0};
     int mEnvRev = -1, mEnvLen = 0, mCursor = 0, mPending = 0, mLastWrite = 0;
+    unsigned mFrame = 0;
+    int mWordW = 0, mWordSize = 0, mWordLen = 0;
 #endif
 };
 

@@ -1,8 +1,8 @@
 /* Host verification harness for Noether (no hardware).
  * Build: g++ -std=c++11 -O2 -ffast-math -Itest/host -Isrc \
  *          src/Noether.cpp test/host/main.cpp -o test/t
- * Modes: ident · length · seam · pulse · speed · sos · window · extend · voct · persist ·
- *        detent · aa · viz · nan · cpu · asan
+ * Modes: ident · length · seam · pulse · tri · speed · sos · extend · voct · persist ·
+ *        detent · aa · viz · undo · stop · clock · nan · cpu · asan
  *
  * Every test prints the number it judged, not just PASS (standard §6/§10). */
 #include "Noether.h"
@@ -39,7 +39,8 @@ static void setInputs(Noether &d, const Ctl *c, int n)
 {
     od::Inlet *ins[] = { &d.mLeftIn, &d.mRightIn, &d.mRecIn, &d.mSpeedIn,
                          &d.mSosIn, &d.mDryIn, &d.mLevelIn,
-                         &d.mVoctIn, &d.mStartIn, &d.mLenIn, &d.mExtIn };
+                         &d.mVoctIn, &d.mExtIn,
+                         &d.mStopIn, &d.mUndoIn, &d.mClkIn };
     for (int i = 0; i < n; ++i) {
         bool matched = false;
         for (auto *p : ins)
@@ -54,8 +55,9 @@ static void setInputs(Noether &d, const Ctl *c, int n)
 static void base(Noether &d, float speed = 1.0f, float sos = 0.5f, float dry = 1.0f, float level = 1.0f)
 {
     Ctl c[] = {{"Speed", speed}, {"SOS", sos}, {"Dry", dry}, {"Level", level}, {"Rec", 0.0f},
-               {"V/Oct", 0.0f}, {"Start", 0.0f}, {"Len", 1.0f}, {"Extend", 0.0f}};
-    setInputs(d, c, 9);
+               {"V/Oct", 0.0f}, {"Extend", 0.0f},
+               {"Stop", 0.0f}, {"Undo", 0.0f}, {"Clk", 0.0f}};
+    setInputs(d, c, 10);
 }
 
 // Feed `src` (mono, may be shorter than the block) through one block; a REC
@@ -211,7 +213,12 @@ static int t_length()
         // and with matching OFF the cut is exactly where REC was pressed
         d.setSeamMatch(0);
         d.clearLoop();
-        silentBlocks(d, 2, out);
+        silentBlocks(d, 1, out);
+        d.zeroBuffer();                      // the menu task: clear, then silence the buffer
+        { double peak = 0; for (int i = 0; i < 10007; ++i) if (fabs(b.s.mpData[i]) > peak) peak = fabs(b.s.mpData[i]);
+          printf("length: clear + zeroBuffer -> state %d, buffer peak %.3f\n", d.getState(), peak);
+          if (!(d.getState() == 0 && peak == 0.0)) ++fails; }
+        silentBlocks(d, 1, out);
         recordPulse(d, frames, 37, out);
         int L2 = d.getLoopSamples();
         printf("length: same, seam match off -> loop %d, expected %d\n", L2, frames - Noether::kSeam);
@@ -258,7 +265,7 @@ static int t_pulse()
 // interior, at every speed and direction.
 static int t_seam()
 {
-    const float speeds[] = { 1.0f, 2.0f, 0.5f, 0.25f, -1.0f, -2.0f, -0.5f, 4.0f, -4.0f };
+    const float speeds[] = { 1.0f, 2.0f, 0.5f, 0.25f, -1.0f, -2.0f, -0.5f };
     int fails = 0;
     for (float sp : speeds) {
         Noether d(1);
@@ -291,6 +298,73 @@ static int t_seam()
 }
 
 // Pitch follows speed: zero crossings scale with |speed|; reverse keeps pitch.
+// A bass triangle across the seam (0.7.1, Nick heard a kink): at 1x the
+// largest step in playback must be the triangle's own slope (within 5 %),
+// down to 30 Hz, and the cut must sit within one period + the match window
+// of where REC was pressed. Noise (worst case for the candidate walk) must
+// still close and stay bounded.
+static float triWave(double ph) { ph -= floor(ph); return (float)(ph < 0.5 ? 4 * ph - 1 : 3 - 4 * ph); }
+static int t_tri()
+{
+    int fails = 0;
+    const double freqs[] = { 30.0, 55.0, 110.0, 440.0 };
+    for (double f : freqs) for (int nc = 1; nc <= 2; ++nc) {
+        Noether d(nc);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        Buffer b(nc, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        const int edge0 = 7, frames = kSR + 1234;
+        const int total = edge0 + frames, blocks = (total + FRAMELENGTH) / FRAMELENGTH + 1;
+        std::vector<float> src(FRAMELENGTH);
+        long t = 0;
+        for (int bl = 0; bl < blocks; ++bl) {
+            for (int i = 0; i < FRAMELENGTH; ++i, ++t) src[i] = 0.8f * triWave(f * (double)(t - edge0) / kSR);
+            int edge = (bl == 0) ? edge0 : -1;
+            int cs = total - bl * FRAMELENGTH;
+            if (cs >= 0 && cs < FRAMELENGTH && bl > 0) edge = cs;
+            block(d, src.data(), FRAMELENGTH, edge, out);
+        }
+        out.clear();
+        silentBlocks(d, 3 * kSR / FRAMELENGTH, out);
+        const double slope = 0.8 * 4.0 * f / kSR;
+        const double step = maxAbsDiff(out, 0, out.size());
+        const int back = frames - d.getLoopSamples();
+        const int maxBack = (int)(kSR / f) + Noether::kMatchWin + 8;
+        const bool ok = step <= slope * 1.05 && back <= maxBack && back >= 0;
+        printf("tri: %5.0f Hz nc%d  max step %.2fx slope  cut %d back (<= %d)  %s\n",
+               f, nc, step / slope, back, maxBack, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    {   // noise: the candidate walk is bounded; the wrap is no worse than the interior
+        Noether d(2);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        Buffer b(2, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        const int edge0 = 7, frames = kSR + 1234;
+        const int total = edge0 + frames, blocks = (total + FRAMELENGTH) / FRAMELENGTH + 1;
+        std::vector<float> src(FRAMELENGTH);
+        unsigned r = 12345u;
+        for (int bl = 0; bl < blocks; ++bl) {
+            for (int i = 0; i < FRAMELENGTH; ++i) { r = r * 1664525u + 1013904223u; src[i] = ((float)(r >> 8) / 8388608.0f - 1.0f) * 0.5f; }
+            int edge = (bl == 0) ? edge0 : -1;
+            int cs = total - bl * FRAMELENGTH;
+            if (cs >= 0 && cs < FRAMELENGTH && bl > 0) edge = cs;
+            block(d, src.data(), FRAMELENGTH, edge, out);
+        }
+        out.clear();
+        silentBlocks(d, 2 * kSR / FRAMELENGTH, out);
+        const int back = frames - d.getLoopSamples();
+        const bool ok = d.getState() == 2 && back >= Noether::kMatchWin && back <= Noether::kSeamSearch + Noether::kMatchWin && allFinite(out);
+        printf("tri: noise -> state %d, cut %d back, finite %d  %s\n", d.getState(), back, (int)allFinite(out), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    return fails ? 1 : 0;
+}
+
 static int t_speed()
 {
     const float speeds[] = { 1.0f, 2.0f, 0.5f, 0.25f, -1.0f, -2.0f };
@@ -380,68 +454,6 @@ static void recordRamp(Noether &d, int frames, int edge0, std::vector<float> &ou
     }
 }
 
-// Start / Len: the head reads only inside the window; Start 0 / Len 1 is
-// bit-identical to no window; a window edge is a crossfade, not a step.
-static int t_window()
-{
-    int fails = 0;
-    // (a) whole loop with Start 0 / Len 1 == the same loop played before
-    //     the controls existed: compare two units, one with Len 1 explicitly
-    //     and one with Len slightly under the threshold (0.9995 rounds to L).
-    {
-        Noether a(1), b(1);
-        base(a, 1.0f, 0.5f, 0.0f, 1.0f); base(b, 1.0f, 0.5f, 0.0f, 1.0f);
-        Buffer ba(1, kSR), bb(1, kSR);
-        a.setSample(&ba.s); b.setSample(&bb.s);
-        std::vector<float> oa, ob;
-        recordRamp(a, 9600, 7, oa); recordRamp(b, 9600, 7, ob);
-        Ctl c[] = {{"Len", 1.0f}, {"Start", 0.0f}}; setInputs(a, c, 2);
-        Ctl c2[] = {{"Len", 1.0f}, {"Start", 0.0f}}; setInputs(b, c2, 2);
-        oa.clear(); ob.clear();
-        silentBlocks(a, 300, oa); silentBlocks(b, 300, ob);
-        int diff = 0; for (size_t i = 0; i < oa.size(); ++i) if (oa[i] != ob[i]) ++diff;
-        printf("window: whole loop, two identical units differ in %d samples\n", diff);
-        if (diff) ++fails;
-        a.setSample(nullptr); b.setSample(nullptr);
-    }
-    // (b) Start 0.5 / Len 0.25: every output sample (after the latch and
-    //     away from the edge crossfades) reads from [0.5, 0.75] of the loop
-    {
-        Noether d(1);
-        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
-        Buffer b(1, kSR);
-        d.setSample(&b.s);
-        std::vector<float> out;
-        recordRamp(d, 9600, 7, out);
-        const int L = d.getLoopSamples();
-        Ctl c[] = {{"Start", 0.5f}, {"Len", 0.25f}}; setInputs(d, c, 2);
-        out.clear();
-        silentBlocks(d, 2 * L / FRAMELENGTH + 2, out);   // latches at the first wrap
-        out.clear();
-        silentBlocks(d, 4 * L / FRAMELENGTH, out);
-        // the ramp value at loop position p is p / 9600 (the recorded length)
-        const float wLo = (float)(L / 2) / 9600.0f, wHi = (float)(3 * L / 4) / 9600.0f;
-        int outside = 0; double lo = 9, hi = -9;
-        for (float v : out) { if (v < lo) lo = v; if (v > hi) hi = v; if (v < wLo - 0.002f || v > wHi + 0.002f) ++outside; }
-        // edge crossfade: the max step must be far below a hard jump (0.25)
-        double step = maxAbsDiff(out, 0, out.size());
-        int ws = d.getWindowStart(), wl = d.getWindowLength();
-        bool ok = outside == 0 && step < 0.25 * 0.5 && ws == L / 2 && (wl == L / 4 || wl == L / 4 + 1);
-        printf("window: start 0.5 len 0.25 -> latched [%d, +%d) of %d; output range %.3f..%.3f (window %.3f..%.3f), %d outside, max step %.4f (hard jump would be 0.25)  %s\n",
-               ws, wl, L, lo, hi, wLo, wHi, outside, step, ok ? "ok" : "FAIL");
-        if (!ok) ++fails;
-        // (c) reverse through the window stays inside it too
-        Ctl c3[] = {{"Speed", -1.0f}}; setInputs(d, c3, 1);
-        out.clear(); silentBlocks(d, 4000 / FRAMELENGTH + 2, out);
-        out.clear(); silentBlocks(d, 4 * L / FRAMELENGTH, out);
-        outside = 0; for (float v : out) if (v < wLo - 0.002f || v > wHi + 0.002f) ++outside;
-        printf("window: reverse, %d samples outside the window  %s\n", outside, outside ? "FAIL" : "ok");
-        if (outside) ++fails;
-        d.setSample(nullptr);
-    }
-    return fails ? 1 : 0;
-}
-
 // Extend: overdub with the ext gate on runs off the end and grows the loop;
 // the new part is the loop copy blended with the input by SOS.
 static int t_extend()
@@ -491,7 +503,7 @@ static int t_voct()
         out.clear(); silentBlocks(d, 24000 / FRAMELENGTH + 2, out);
         out.clear(); silentBlocks(d, kSR / FRAMELENGTH, out);
         double f = zeroCrossings(out, 0, out.size()) / 2.0;
-        double expect = 200.0 * pow(2.0, v * 10.0);
+        double expect = 200.0 * fmin(2.0, pow(2.0, v * 10.0));   // clamped at 2x
         bool ok = fabs(f - expect) / expect < 0.02;
         printf("voct: %+.1f -> %.1f Hz, expected %.1f  %s\n", v, f, expect, ok ? "ok" : "FAIL");
         if (!ok) ++fails;
@@ -528,9 +540,15 @@ static int t_persist()
     // a mono file into a stereo unit, and a short buffer, must not fault
     Buffer mono(1, 1000); mono.s.mSampleLoadCount = 500;
     int k = c.importLoop(&mono.s);
-    bool ok = n == L && m == L && diff == 0 && pdiff == 0 && c.getState() == 2 && k == 500;
-    printf("persist: exported %d, imported %d (loop %d), %d buffer samples differ, %d output samples differ, state %d, mono-500 import -> %d  %s\n",
-           n, m, L, diff, pdiff, c.getState(), k, ok ? "ok" : "FAIL");
+    // a completed load whose "loaded" counter was never set: frame count trusted
+    Buffer zl(1, 700); zl.s.mSampleLoadCount = 0;
+    int kz = c.importLoop(&zl.s);
+    // and the refusal codes
+    Buffer tiny(1, 2); int kt = c.importLoop(&tiny.s);
+    int kn = c.importLoop(nullptr);
+    bool ok = n == L && m == L && diff == 0 && pdiff == 0 && c.getState() == 2 && k == 500 && kz == 700 && kt == -4 && kn == -1;
+    printf("persist: exported %d, imported %d (loop %d), %d buffer samples differ, %d output samples differ, state %d, mono-500 import -> %d, zero-loadcount-700 -> %d, tiny -> %d, null -> %d  %s\n",
+           n, m, L, diff, pdiff, c.getState(), k, kz, kt, kn, ok ? "ok" : "FAIL");
     a.setSample(nullptr); c.setSample(nullptr);
     return ok ? 0 : 1;
 }
@@ -542,8 +560,8 @@ static int t_detent()
     struct Case { float in; float expect; int locked; };
     const Case cases[] = {
         { 1.0f, 1.0f, 1 }, { 1.02f, 1.0f, 1 }, { 0.98f, 1.0f, 1 }, { 1.05f, 1.05f, 0 },
-        { 2.03f, 2.0f, 1 }, { 0.51f, 0.5f, 1 }, { 0.255f, 0.25f, 1 }, { 0.26f, 0.26f, 0 }, { 3.9f, 4.0f, 1 },
-        { -1.01f, -1.0f, 1 }, { -2.5f, -2.5f, 0 }, { 0.02f, 0.0f, 1 }, { 0.1f, 0.1f, 0 },
+        { 2.03f, 2.0f, 1 }, { 0.51f, 0.5f, 1 }, { 0.255f, 0.25f, 1 }, { 0.26f, 0.26f, 0 }, { 3.9f, 2.0f, 1 },
+        { -1.01f, -1.0f, 1 }, { -1.5f, -1.5f, 0 }, { 0.02f, 0.0f, 1 }, { 0.1f, 0.1f, 0 },
         { 1.5f, 1.5f, 0 },
     };
     int fails = 0;
@@ -594,7 +612,7 @@ static int t_aa()
     {
         double rms1 = 0, rms4 = 0;
         for (int pass = 0; pass < 2; ++pass) {
-            float sp = pass ? 4.0f : 1.0f;
+            float sp = pass ? 2.0f : 1.0f;
             Noether d(1);
             base(d, 1.0f, 0.5f, 0.0f, 1.0f);
             Buffer b(1, kSR);
@@ -610,8 +628,8 @@ static int t_aa()
             d.setSample(nullptr);
         }
         double db = 20.0 * log10(rms4 / (rms1 > 1e-9 ? rms1 : 1e-9));
-        bool ok = db < -6.0;
-        printf("aa: 8 kHz tone at 4x vs 1x: %.1f dB (anti-alias LP, expect well below -6)  %s\n", db, ok ? "ok" : "FAIL");
+        bool ok = db < -2.0;
+        printf("aa: 8 kHz tone at 2x vs 1x: %.1f dB (anti-alias LP at 2x, expect a few dB down)  %s\n", db, ok ? "ok" : "FAIL");
         if (!ok) ++fails;
     }
     return fails ? 1 : 0;
@@ -627,7 +645,8 @@ struct RecFB : od::FrameBuffer {
     void line(od::Color, int x0, int y0, int x1, int y1) override { touch(x0, y0); touch(x1, y1); ++lines; }
     void hline(od::Color, int x, int x2, int y, int) override { touch(x, y); touch(x2, y); ++lines; }
     void vline(od::Color, int x, int y, int y2, int) override { touch(x, y); touch(x, y2); ++lines; }
-    int  text(od::Color, int x, int y, const char *, int, int) override { touch(x, y); ++texts; return 20; }
+    // like the SDK: returns the x AFTER the last glyph (6 px advance here)
+    int  text(od::Color, int x, int y, const char *s, int, int) override { touch(x, y); ++texts; int n = 0; while (s[n]) ++n; return x + 6 * n; }
     void circle(od::Color, int x, int y, int r) override { touch(x - r, y - r); touch(x + r, y + r); ++circles; lastCircleR = r; }
     void fillCircle(od::Color, int x, int y, int r) override { touch(x - r, y - r); touch(x + r, y + r); ++fills; }
     void reset() { minx = miny = 1 << 30; maxx = maxy = -(1 << 30); pixels = lines = circles = fills = texts = calls = 0; lastCircleR = -1; }
@@ -697,9 +716,9 @@ static int t_viz()
     bool okScale = fb.circles == 1 && fb.texts >= 3 && fb.minx >= 0 && fb.maxx < 128 && fb.miny >= 0 && fb.maxy < 64;
     printf("viz: scale at 1x -> hollow marker %d, texts %d, bbox x %d..%d y %d..%d  %s\n", fb.circles, fb.texts, fb.minx, fb.maxx, fb.miny, fb.maxy, okScale ? "ok" : "FAIL");
     if (!okScale) ++fails;
-    float p1 = noether::NoetherScale::place(1.0f), p2 = noether::NoetherScale::place(2.0f), p4 = noether::NoetherScale::place(4.0f), pq = noether::NoetherScale::place(0.25f);
-    bool okPlace = fabs(p1 - 0.6f) < 0.01f && fabs(p2 - 0.8f) < 0.01f && fabs(p4 - 1.0f) < 0.01f && fabs(pq - 0.2f) < 0.01f;
-    printf("viz: scale placement 1/4 %.2f  1 %.2f  2 %.2f  4 %.2f  %s\n", pq, p1, p2, p4, okPlace ? "ok" : "FAIL");
+    float p1 = noether::NoetherScale::place(1.0f), p2 = noether::NoetherScale::place(2.0f), ph = noether::NoetherScale::place(0.5f), pq = noether::NoetherScale::place(0.25f);
+    bool okPlace = fabs(p1 - 0.75f) < 0.01f && fabs(p2 - 1.0f) < 0.01f && fabs(ph - 0.5f) < 0.01f && fabs(pq - 0.25f) < 0.01f;
+    printf("viz: scale placement 1/4 %.2f  1/2 %.2f  1 %.2f  2 %.2f  %s\n", pq, ph, p1, p2, okPlace ? "ok" : "FAIL");
     if (!okPlace) ++fails;
 
     // extend: the outer winding
@@ -717,12 +736,248 @@ static int t_viz()
     return fails ? 1 : 0;
 }
 
+static void undoEdge(Noether &d, std::vector<float> &out)
+{
+    float *u = d.mUndoIn.buffer();
+    for (int i = 0; i < FRAMELENGTH; ++i) u[i] = 1.0f;
+    std::vector<float> z(FRAMELENGTH, 0.0f);
+    block(d, z.data(), FRAMELENGTH, -1, out);
+    for (int i = 0; i < FRAMELENGTH; ++i) u[i] = 0.0f;
+    block(d, z.data(), FRAMELENGTH, -1, out);
+}
+
+// Undo: an overdub pass is swapped back out (bit-identical to the take),
+// undo again brings it back (redo); an extend's length is undone too; undo
+// with nothing to undo changes nothing.
+static int t_undo()
+{
+    int fails = 0;
+    Noether d(2);
+    base(d, 1.0f, 0.0f, 0.0f, 1.0f);    // SOS 0: the overdub REPLACES, easy to see
+    Buffer b(2, kSR), ub(2, kSR);
+    d.setSample(&b.s);
+    d.setUndoSample(&ub.s);
+    std::vector<float> out;
+    recordSine(d, 300.0, 9600, 3, out, 0.5);
+    const int L = d.getLoopSamples();
+    std::vector<float> take(b.data.begin(), b.data.begin() + (size_t)L * 2);
+    // nothing to undo yet
+    undoEdge(d, out);
+    silentBlocks(d, 4, out);
+    int diff0 = 0; for (size_t i = 0; i < take.size(); ++i) if (b.data[i] != take[i]) ++diff0;
+    printf("undo: before any overdub -> canUndo %d, %d samples changed by an undo edge\n", d.canUndo(), diff0);
+    if (diff0 || d.canUndo()) ++fails;
+    // overdub a full pass of DC 0.4
+    std::vector<float> dc(FRAMELENGTH, 0.4f);
+    block(d, dc.data(), FRAMELENGTH, 0, out);
+    for (int k = 0; k < L / FRAMELENGTH + 2; ++k) block(d, dc.data(), FRAMELENGTH, -1, out);
+    block(d, dc.data(), FRAMELENGTH, 0, out);
+    silentBlocks(d, 4, out);
+    std::vector<float> dubbed(b.data.begin(), b.data.begin() + (size_t)L * 2);
+    int changed = 0; for (size_t i = 0; i < take.size(); ++i) if (dubbed[i] != take[i]) ++changed;
+    // undo
+    undoEdge(d, out);
+    int blocks = 0; while (d.isRestoring() && blocks < 1000) { silentBlocks(d, 1, out); ++blocks; }
+    int back = 0; for (size_t i = 0; i < take.size(); ++i) if (b.data[i] != take[i]) ++back;
+    printf("undo: overdub changed %d of %d samples; undo restored in %d blocks, %d samples still differ from the take, canUndo %d\n",
+           changed, (int)take.size(), blocks, back, d.canUndo());
+    if (!(changed > take.size() / 2 && back == 0 && d.canUndo() == 1)) ++fails;
+    // redo
+    undoEdge(d, out);
+    blocks = 0; while (d.isRestoring() && blocks < 1000) { silentBlocks(d, 1, out); ++blocks; }
+    int redo = 0; for (size_t i = 0; i < take.size(); ++i) if (b.data[i] != dubbed[i]) ++redo;
+    printf("undo: redo -> %d samples differ from the overdubbed loop\n", redo);
+    if (redo) ++fails;
+    // an extend, then undo: length and content come back
+    Ctl ce[] = {{"Extend", 1.0f}}; setInputs(d, ce, 1);
+    block(d, dc.data(), FRAMELENGTH, 0, out);
+    for (int k = 0; k < L / FRAMELENGTH + 30; ++k) block(d, dc.data(), FRAMELENGTH, -1, out);
+    block(d, dc.data(), FRAMELENGTH, 0, out);
+    silentBlocks(d, 2, out);
+    const int L1 = d.getLoopSamples();
+    undoEdge(d, out);
+    blocks = 0; while (d.isRestoring() && blocks < 2000) { silentBlocks(d, 1, out); ++blocks; }
+    int backX = 0; for (size_t i = 0; i < (size_t)L * 2; ++i) if (b.data[i] != dubbed[i]) ++backX;
+    printf("undo: extend %d -> %d, undo -> %d, %d samples differ from the pre-extend loop\n", L, L1, d.getLoopSamples(), backX);
+    if (!(L1 > L && d.getLoopSamples() == L && backX == 0)) ++fails;
+    d.setUndoSample(nullptr);
+    d.setSample(nullptr);
+    return fails ? 1 : 0;
+}
+
+// Stop gate: high fades the loop out within 10 ms and holds the head; low
+// resumes from the same position; the state reads STOP while held.
+static int t_stop()
+{
+    int fails = 0;
+    Noether d(1);
+    base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+    Buffer b(1, kSR);
+    d.setSample(&b.s);
+    std::vector<float> out;
+    recordSine(d, 300.0, 9600, 3, out, 0.5);
+    Ctl c0[] = {{"Stop", 1.0f}}; setInputs(d, c0, 1);
+    out.clear(); silentBlocks(d, 8, out);                 // 21 ms
+    double tail = 0; for (size_t i = out.size() - FRAMELENGTH; i < out.size(); ++i) tail = fmax(tail, fabs(out[i]));
+    int p1 = d.vizPos();
+    silentBlocks(d, 40, out);
+    int p2 = d.vizPos();
+    int st = d.getState();
+    Ctl c1[] = {{"Stop", 0.0f}}; setInputs(d, c1, 1);
+    out.clear(); silentBlocks(d, 8, out);
+    double head = 0; for (size_t i = out.size() - FRAMELENGTH; i < out.size(); ++i) head = fmax(head, fabs(out[i]));
+    int p3 = d.vizPos();
+    bool ok = tail == 0.0 && p1 == p2 && st == 4 && head > 0.3 && p3 > p2 && p3 - p2 < 9 * FRAMELENGTH && d.getState() == 2;
+    printf("stop: after gate low: last block peak %.4f, head %d -> %d (held), state %d; after gate high: peak %.3f, head %d, state %d  %s\n",
+           tail, p1, p2, st, head, p3, d.getState(), ok ? "ok" : "FAIL");
+    if (!ok) ++fails;
+    d.setSample(nullptr);
+    return fails ? 1 : 0;
+}
+
+// Run `blocks` blocks with a clock of `period` samples on Clk (edge at
+// absolute sample multiples of period, phase-tracked across calls via t),
+// input `src` value, optional REC edge at absolute sample recAt.
+struct ClockRig {
+    Noether &d; std::vector<float> &out; int period; long t = 0;
+    ClockRig(Noether &dd, std::vector<float> &o, int p) : d(dd), out(o), period(p) {}
+    void run(int blocks, float inVal = 0.0f, long recAt = -1)
+    {
+        float *L = d.mLeftIn.buffer(), *R = d.mRightIn.buffer(), *rec = d.mRecIn.buffer(), *clk = d.mClkIn.buffer();
+        for (int b = 0; b < blocks; ++b) {
+            for (int i = 0; i < FRAMELENGTH; ++i, ++t) {
+                L[i] = R[i] = inVal;
+                clk[i] = ((t % period) < 4) ? 1.0f : 0.0f;
+                rec[i] = (recAt >= 0 && t >= recAt && t < recAt + 4) ? 1.0f : 0.0f;
+            }
+            d.process();
+            const float *o = d.mLeftOut.buffer();
+            for (int i = 0; i < FRAMELENGTH; ++i) out.push_back(o[i]);
+        }
+        for (int i = 0; i < FRAMELENGTH; ++i) { rec[i] = 0.0f; clk[i] = 0.0f; }
+    }
+};
+
+// Clock. Free: an edge restarts the loop. Sync: REC arms and the take starts
+// / stops on the next edge, so the loop is exactly N periods; every N-th edge
+// re-syncs the head even at 2x; no clock for 4 s -> REC acts immediately.
+static int t_clock()
+{
+    int fails = 0;
+    const int P = 12000;   // 0.25 s at 48 kHz
+    // ── free mode: reset ──
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        Buffer b(1, kSR * 2);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        recordRamp(d, 9600, 7, out);
+        ClockRig rig(d, out, P);
+        rig.run(2);                                   // an edge lands in here (t=0)
+        int p0 = d.vizPos();
+        // the head was reset near the seam: position small (a couple of blocks in)
+        bool ok = p0 >= 0 && p0 < 3 * FRAMELENGTH;
+        printf("clock: free mode, edge -> head at %d (expect < %d)  %s\n", p0, 3 * FRAMELENGTH, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── sync mode: armed take of exactly 4 periods ──
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        ClockRig rig(d, out, P);
+        rig.run(20, 0.3f);                            // a few edges so the clock is "present"
+        long now = rig.t;
+        const long startEdge = ((now + 50) / P + 1) * P;   // the first edge after the arm
+        rig.run(1, 0.3f, now + 50);                   // REC mid-period: arms
+        int armed = d.isArmed(), st = d.getState();
+        rig.run(P / FRAMELENGTH + 2, 0.3f);           // the next edge starts the take
+        int st2 = d.getState();
+        long recStart = rig.t;
+        rig.run(3 * P / FRAMELENGTH, 0.3f);           // ~3 periods in
+        rig.run(1, 0.3f, rig.t + 30);                 // REC: arm the stop
+        int armed2 = d.isArmed();
+        rig.run(2 * P / FRAMELENGTH + 2, 0.3f);       // the 4th edge closes
+        int L = d.getLoopSamples(), N = d.getSyncN(), st3 = d.getState();
+        bool ok = armed == 1 && st == 0 && st2 == 1 && armed2 == 2 && st3 == 2 &&
+                  N == 4 && (L == 4 * P);
+        printf("clock: sync armed %d (state %d) -> recording %d -> stop armed %d -> loop %d = %d periods (expect exactly %d, N=4), state %d  %s\n",
+               armed, st, st2, armed2, L, N, 4 * P, st3, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        // ── the clocked seam is click-free: a 100 Hz pulse (period 480, P = 25 periods) ──
+        {
+            Noether e(1);
+            base(e, 1.0f, 0.5f, 0.0f, 1.0f);
+            e.mSyncOpt.set(2);
+            Buffer be(1, kSR * 4);
+            e.setSample(&be.s);
+            std::vector<float> oe;
+            // a pulse source in phase with the clock
+            float *Lb = e.mLeftIn.buffer(), *Rb = e.mRightIn.buffer(), *rb = e.mRecIn.buffer(), *cb = e.mClkIn.buffer();
+            long t = 0; long recAt1 = 20 * FRAMELENGTH + 50, recAt2 = -1; int Lp = 0;
+            for (int blk = 0; blk < 700; ++blk) {
+                for (int i = 0; i < FRAMELENGTH; ++i, ++t) {
+                    Lb[i] = Rb[i] = ((t % 480) < 240) ? 0.8f : -0.8f;
+                    cb[i] = ((t % P) < 4) ? 1.0f : 0.0f;
+                    rb[i] = ((t >= recAt1 && t < recAt1 + 4) || (recAt2 >= 0 && t >= recAt2 && t < recAt2 + 4)) ? 1.0f : 0.0f;
+                }
+                e.process();
+                if (e.getState() == 1 && recAt2 < 0 && t > recAt1 + 2 * P) recAt2 = t + 10;   // arm the stop ~2 periods in
+                if (e.getState() == 2 && Lp == 0) Lp = e.getLoopSamples();
+                for (int i = 0; i < FRAMELENGTH; ++i) { rb[i] = 0.0f; cb[i] = 0.0f; }
+            }
+            for (int i = 0; i < FRAMELENGTH; ++i) { Lb[i] = Rb[i] = 0.0f; }
+            oe.clear(); silentBlocks(e, 20 * Lp / FRAMELENGTH, oe);
+            int last = -1, irregular = 0, count = 0;
+            for (size_t i = 1; i < oe.size(); ++i)
+                if (oe[i] > 0.0f && oe[i - 1] <= 0.0f) { if (last >= 0) { int iv = (int)i - last; ++count; if (iv < 479 || iv > 481) ++irregular; } last = (int)i; }
+            bool okp = Lp > 0 && (Lp % 480) == 0 && irregular == 0 && count > 100;
+            printf("clock: clocked pulse loop %d (= %d periods of 480, %d clock periods), 20 wraps: %d periods measured, %d irregular  %s\n",
+                   Lp, Lp / 480, Lp / P, count, irregular, okp ? "ok" : "FAIL");
+            if (!okp) ++fails;
+            e.setSample(nullptr);
+        }
+        // ── downbeat re-sync at 2x: after each 4 edges the head is back near the seam ──
+        Ctl c2[] = {{"Speed", 2.0f}}; setInputs(d, c2, 1);
+        rig.run(24000 / FRAMELENGTH, 0.0f);           // glide settles
+        int bad = 0, checks = 0;
+        for (int rep = 0; rep < 6; ++rep) {
+            // step to just after the next downbeat: run until t is a multiple of 4P plus a block
+            long target = startEdge + (((rig.t - startEdge) / (4L * P)) + 1) * 4L * P;   // the next downbeat
+            rig.run((int)((target - rig.t) / FRAMELENGTH) + 1, 0.0f);
+            int pos = d.vizPos();
+            ++checks;
+            if (!(pos < 4 * FRAMELENGTH || pos > L - 4 * FRAMELENGTH)) ++bad;
+        }
+        printf("clock: 2x, head at the downbeat within a few blocks of the seam: %d of %d checks failed  %s\n", bad, checks, bad ? "FAIL" : "ok");
+        if (bad) ++fails;
+        (void)recStart;
+        // ── clock loss: after 4 s without edges, REC acts immediately ──
+        d.clearLoop();
+        silentBlocks(d, 5 * kSR / FRAMELENGTH, out);   // 5 s of nothing
+        int hc = d.hasClock();
+        std::vector<float> dc(FRAMELENGTH, 0.3f);
+        block(d, dc.data(), FRAMELENGTH, 0, out);
+        int stL = d.getState(), armL = d.isArmed();
+        bool okL = hc == 0 && stL == 1 && armL == 0;
+        printf("clock: after 5 s silence hasClock %d, REC -> state %d armed %d  %s\n", hc, stL, armL, okL ? "ok" : "FAIL");
+        if (!okL) ++fails;
+        d.setSample(nullptr);
+    }
+    return fails ? 1 : 0;
+}
+
 // Poison every inlet with NaN / inf; output stays finite; unit recovers.
 static int t_nan()
 {
     const float poisons[] = { NAN, INFINITY, -INFINITY };
     const char *ports[] = { "Left In", "Right In", "Rec", "Speed", "SOS", "Dry", "Level",
-                            "V/Oct", "Start", "Len", "Extend" };
+                            "V/Oct", "Extend", "Stop", "Undo", "Clk" };
     int fails = 0;
     for (const char *port : ports) for (float p : poisons) {
         Noether d(2);
@@ -771,12 +1026,15 @@ static int t_cpu()
 static int t_asan()
 {
     int bad = 0;
-    const float speeds[] = { -4.0f, -1.0f, -0.01f, 0.0f, 0.01f, 1.0f, 4.0f, 9.0f, -9.0f };
-    const float wins[][2] = { {0.0f, 1.0f}, {0.5f, 0.25f}, {0.99f, 0.001f}, {0.3f, 0.999f} };
-    for (int ch = 1; ch <= 2; ++ch) for (float sp : speeds) for (float sos : {0.0f, 1.0f}) for (auto &wv : wins) {
+    const float speeds[] = { -2.0f, -1.0f, -0.01f, 0.0f, 0.01f, 1.0f, 2.0f, 9.0f, -9.0f };
+    for (int ch = 1; ch <= 2; ++ch) for (float sp : speeds) for (float sos : {0.0f, 1.0f}) for (int gridDummy = 0; gridDummy < 2; ++gridDummy) {
         Noether d(ch);
         base(d, sp, sos, 1.0f, 1.0f);
-        Ctl wc[] = {{"Start", wv[0]}, {"Len", wv[1]}, {"Extend", 1.0f}, {"V/Oct", 0.05f}}; setInputs(d, wc, 4);
+        Ctl wc[] = {{"Extend", 1.0f}, {"V/Oct", 0.05f}}; setInputs(d, wc, 2);
+        Buffer ub(ch, kSR / 4);
+        d.setUndoSample(&ub.s);
+        d.mSyncOpt.set((gridDummy == 1) ? 2 : 1);
+        { float *ck = d.mClkIn.buffer(); for (int i = 0; i < FRAMELENGTH; ++i) ck[i] = (i < 2) ? 1.0f : 0.0f; }   // an edge every block
         Buffer b(ch, kSR / 4);     // small buffer: force the buffer-full close
         d.setSample(&b.s);
         std::vector<float> out;
@@ -788,15 +1046,24 @@ static int t_asan()
         for (int k = 0; k < 50; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
         block(d, src.data(), FRAMELENGTH, 5, out);                       // overdub out
         for (int k = 0; k < 50; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
+        undoEdge(d, out); for (int k = 0; k < 30; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
+        undoEdge(d, out); undoEdge(d, out);                              // redo, and an undo mid-restore
+        { Ctl pg[] = {{"Stop", 1.0f}}; setInputs(d, pg, 1); }
+        for (int k = 0; k < 10; ++k) block(d, src.data(), FRAMELENGTH, 3, out);   // rec edges while stopped
+        { Ctl pg[] = {{"Stop", 0.0f}}; setInputs(d, pg, 1); }
         d.clearLoop();
         for (int k = 0; k < 5; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
         block(d, src.data(), FRAMELENGTH, 127, out);                     // edge on the last sample
         block(d, src.data(), FRAMELENGTH, 0, out);                       // 1-sample take
         for (int k = 0; k < 20; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
-        for (float v : out) if (!std::isfinite(v) || fabs(v) > 4.0f) ++bad;
+        // bound: the loop is softLimited to +/-2, a jump overlap can sum two of
+        // those for 8 ms, and the dry input here is 1.5 -> 5.5 is legitimate
+        for (float v : out) if (!std::isfinite(v) || fabs(v) > 6.0f) ++bad;
+        d.setUndoSample(nullptr);
         d.setSample(nullptr);
         // and with no buffer at all, mid-flight
         block(d, src.data(), FRAMELENGTH, 0, out);
+        undoEdge(d, out);
     }
     printf("asan: %d non-finite / out-of-range samples\n", bad);
     return bad ? 1 : 0;
@@ -811,13 +1078,16 @@ int main(int argc, char **argv)
     else if (!strcmp(m, "length")) r = t_length();
     else if (!strcmp(m, "seam"))   r = t_seam();
     else if (!strcmp(m, "pulse"))  r = t_pulse();
-    else if (!strcmp(m, "window")) r = t_window();
+    else if (!strcmp(m, "tri"))    r = t_tri();
     else if (!strcmp(m, "extend")) r = t_extend();
     else if (!strcmp(m, "voct"))   r = t_voct();
     else if (!strcmp(m, "persist")) r = t_persist();
     else if (!strcmp(m, "detent")) r = t_detent();
     else if (!strcmp(m, "aa"))     r = t_aa();
     else if (!strcmp(m, "viz"))    r = t_viz();
+    else if (!strcmp(m, "undo"))   r = t_undo();
+    else if (!strcmp(m, "stop"))   r = t_stop();
+    else if (!strcmp(m, "clock"))  r = t_clock();
     else if (!strcmp(m, "speed"))  r = t_speed();
     else if (!strcmp(m, "sos"))    r = t_sos();
     else if (!strcmp(m, "nan"))    r = t_nan();

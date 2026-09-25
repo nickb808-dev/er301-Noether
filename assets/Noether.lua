@@ -3,9 +3,9 @@
 --
 -- Noether — seamless vari-speed loop recorder.
 -- One REC button (empty -> record -> play -> overdub in -> overdub out), a
--- phase-matched seam, continuous Speed from -4x to +4x plus 1 V/oct, a
--- Start / Len playback window, Extend (overdub past the end grows the loop),
--- SOS crossfader, Dry / Level, and loops that are saved to the card with the
+-- phase-matched seam, continuous Speed from -2x to +2x plus 1 V/oct, Extend
+-- (overdub past the end grows the loop), undo, stop, a clock input, SOS
+-- crossfader, Dry / Level, and loops that are saved to the card with the
 -- preset and come back with it. See README.md and LOOPER-PLAN.md.
 --
 -- EVERY app.* / self:* CALL HERE ALREADY APPEARS IN A SHIPPED UNIT'S LUA
@@ -25,6 +25,7 @@ local SamplePool = require "Sample.Pool"
 local SamplePoolInterface = require "Sample.Pool.Interface"
 local Task = require "Unit.MenuControl.Task"
 local MenuHeader = require "Unit.MenuControl.Header"
+local OptionControl = require "Unit.MenuControl.OptionControl"
 local Overlay = require "Overlay"
 local ply = app.SECTION_PLY
 
@@ -32,7 +33,7 @@ local libnoether = require "noether.libnoether"
 
 -- THE RUNNING VERSION, ON SCREEN (standard §10c). tools/check-version.sh
 -- fails the build if this drifts from the Makefile or toc.lua.
-local VERSION = "0.3.0"
+local VERSION = "0.7.2"
 
 -- Default loop buffer length. Changed from the menu (10 / 30 / 60 s).
 local kDefaultSecs = 30
@@ -79,6 +80,25 @@ function Noether:onLoadGraph(channelCount)
   connect(rec, "Out", head, "Rec")
   self:addMonoBranch("rec", rec, "In", rec, "Out")
 
+  -- UNDO: a trigger. Swaps the last overdub / extend pass out; again = redo.
+  local undo = self:addObject("undo", app.Comparator())
+  connect(undo, "Out", head, "Undo")
+  self:addMonoBranch("undo", undo, "In", undo, "Out")
+
+  -- CLK: a trigger. Free mode: restarts the loop. Sync mode: the clock that
+  -- quantises REC and re-syncs the loop every N edges.
+  local clk = self:addObject("clk", app.Comparator())
+  connect(clk, "Out", head, "Clk")
+  self:addMonoBranch("clk", clk, "In", clk, "Out")
+
+  -- STOP: a latched gate, off by default = playing. (A "play" gate that
+  -- starts ON would need a simulated edge at load, which races a preset's
+  -- restore of the Comparator state — so the polarity is the safe one.)
+  local stop = self:addObject("stop", app.Comparator())
+  stop:setToggleMode()
+  connect(stop, "Out", head, "Stop")
+  self:addMonoBranch("stop", stop, "In", stop, "Out")
+
   -- EXTEND: a latched gate (tap on, tap off), same idiom as Dirac's Hold.
   local extg = self:addObject("extg", app.Comparator())
   extg:setToggleMode()
@@ -94,8 +114,6 @@ function Noether:onLoadGraph(channelCount)
   self:addMonoBranch("voct", tune, "In", tune, "Out")
 
   param(self, head, "speed", "Speed", 1.0)
-  param(self, head, "start", "Start", 0.0)
-  param(self, head, "len",   "Len",   1.0)
   param(self, head, "sos",   "SOS",   0.5)
   param(self, head, "dry",   "Dry",   1.0)
   param(self, head, "level", "Level", 1.0)
@@ -129,6 +147,27 @@ function Noether:setSample(sample)
   self:notifyControls("setSample", sample)
 end
 
+-- The undo buffer: a second pool buffer of the same size, held by the unit
+-- alone (it is never attached to the head's Sample, so the waveform view and
+-- the editor never see it). Same claim / release / unload discipline.
+function Noether:setUndoBuffer(sample)
+  local old = self.undoSample
+  if old then
+    old:release(self)
+    self.undoSample = nil
+  end
+  self.undoSample = sample
+  if sample then
+    sample:claim(self)
+    self.objects.head:setUndoSample(sample.pSample)
+  else
+    self.objects.head:setUndoSample(nil)
+  end
+  if old and old ~= sample and not old:isShared() then
+    SamplePool.unload(old)
+  end
+end
+
 function Noether:createBuffer(secs)
   local sample, msg = SamplePool.create {
     root = "noether",
@@ -141,6 +180,18 @@ function Noether:createBuffer(secs)
     self.ownBuffer = sample
   else
     Overlay.flashMainMessage("Buffer failed: %s", msg or "?")
+    return
+  end
+  local usample = SamplePool.create {
+    root = "noether-undo",
+    channels = self.channelCount,
+    secs = secs
+  }
+  if usample then
+    self:setUndoBuffer(usample)
+  else
+    self:setUndoBuffer(nil)
+    Overlay.flashMainMessage("No memory for undo (%d s)", secs)
   end
 end
 
@@ -151,6 +202,7 @@ end
 
 function Noether:doClearLoop()
   self.objects.head:clearLoop()
+  self.objects.head:zeroBuffer()
   Overlay.flashMainMessage("Loop cleared.")
 end
 
@@ -219,26 +271,60 @@ function Noether:saveLoopToCard()
     self.loopPath = path
     self.loopRevSaved = head:getLoopRev()
     self.savingSample = export
+    self:setPersistStatus("saving %s", Path.getFilename(path))
   else
+    self:setPersistStatus("save refused (card?)")
     SamplePool.unload(export)
   end
+end
+
+-- Every step of the load / save path records a one-line status, shown on
+-- the menu's sub display (standard §15: put the state that explains a
+-- failure somewhere reachable without the thing that fails) and logged as
+-- a breadcrumb for crash reports.
+function Noether:setPersistStatus(fmt, ...)
+  local ok, msg = pcall(string.format, fmt, ...)
+  self.persistStatus = ok and msg or fmt
+  app.logInfo("Noether: %s", self.persistStatus)
 end
 
 function Noether:sampleStatusChanged(sample)
   if sample == nil then return end
   if sample == self.savingSample and not sample:isPending() then
     self.savingSample = nil
+    self:setPersistStatus("saved %s", Path.getFilename(sample.path or "?"))
     if sample.userCount == 0 then SamplePool.unload(sample) end
   elseif sample == self.pendingLoop and not sample:isPending() then
     self.pendingLoop = nil
     local ok, n = pcall(function() return self.objects.head:importLoop(sample.pSample) end)
     if ok and n and n > 0 then
       self.loopRevSaved = self.objects.head:getLoopRev()
+      self:setPersistStatus("loaded %d frames, state %d", n, self.objects.head:getState())
     else
-      app.logError("%s: loop file did not import (%s)", self, tostring(n))
+      -- say what the engine saw, not just that it said no
+      local ch = sample.getChannelCount and sample:getChannelCount() or -1
+      local len = sample.length and sample:length() or -1
+      local st = sample.getStatusText and sample:getStatusText() or "?"
+      self:setPersistStatus("refused %s: ch %s len %s st %s %s", tostring(n), tostring(ch), tostring(len), tostring(st), tostring(sample.reason or ""))
+      app.logError("%s: loop file did not import (%s)", self, self.persistStatus)
     end
     if sample.userCount == 0 then SamplePool.unload(sample) end
+  elseif sample == self.pendingLoop then
+    self:setPersistStatus("loading %s", Path.getFilename(sample.path or "?"))
   end
+end
+
+-- Load the loop file at self.loopPath into the buffer (deserialize, and the
+-- menu's Reload task).
+function Noether:loadLoopFromCard()
+  local path = self.loopPath
+  if not path then self:setPersistStatus("no loop file"); return end
+  if not Path.exists(path) then self:setPersistStatus("missing: %s", Path.getFilename(path)); return end
+  local s, status = SamplePool.load(path)
+  if not s then self:setPersistStatus("load failed: %s", tostring(status)); return end
+  self.pendingLoop = s
+  self:setPersistStatus("load queued (%s)", s:isPending() and "pending" or "ready")
+  if not s:isPending() then self:sampleStatusChanged(s) end
 end
 
 function Noether:serialize()
@@ -248,6 +334,7 @@ function Noether:serialize()
   end
   t.bufferSecs = self.bufferSecs
   local head = self.objects.head
+  t.syncN = head:getSyncN()
   if head:getLoopSamples() > 0 then
     if self.loopPath == nil or head:getLoopRev() ~= self.loopRevSaved then
       self:saveLoopToCard()
@@ -260,25 +347,32 @@ end
 function Noether:deserialize(t)
   Unit.deserialize(self, t)
   if t.bufferSecs then self.bufferSecs = t.bufferSecs end
+  if t.syncN then self.objects.head:setSyncN(t.syncN) end
   if t.sample then
     local sample = SamplePool.deserializeSample(t.sample, self.chain)
     if sample then
       self:setSample(sample)
+      -- the undo buffer follows the loop buffer's size
+      local usample = SamplePool.create {
+        root = "noether-undo",
+        channels = self.channelCount,
+        secs = self.bufferSecs or kDefaultSecs
+      }
+      self:setUndoBuffer(usample or nil)
     else
       app.logError("%s:deserialize: failed to load sample.", self)
     end
   end
-  if t.loopPath and Path.exists(t.loopPath) then
-    local s = SamplePool.load(t.loopPath)
-    if s then
-      self.loopPath = t.loopPath
-      self.pendingLoop = s
-      if not s:isPending() then self:sampleStatusChanged(s) end
-    end
+  if t.loopPath then
+    self.loopPath = t.loopPath
+    self:loadLoopFromCard()
+  else
+    self:setPersistStatus("preset carries no loop file")
   end
 end
 
 function Noether:onRemove()
+  self:setUndoBuffer(nil)
   self:setSample(nil)
   Unit.onRemove(self)
 end
@@ -287,13 +381,24 @@ end
 -- Tasks, not OptionControls: creating a buffer allocates, which the audio
 -- thread may never do (standard §2 / §3).
 local menu = {
+  "clockHeader", "sync",
   "bufferHeader", "buf10", "buf30", "buf60",
-  "loopHeader", "clearLoop", "attachExisting", "editBuffer",
+  "loopHeader", "clearLoop", "attachExisting", "editBuffer", "reloadLoop",
 }
 
 function Noether:onShowMenu(objects, branches)
   local controls = {}
-  controls.bufferHeader = MenuHeader { description = "Loop buffer  (Noether v" .. VERSION .. ")" }
+  controls.clockHeader = MenuHeader { description = "Clock  (Noether v" .. VERSION .. ")" }
+  -- free: clk restarts the loop. sync: rec waits for the next clock edge,
+  -- the loop is a whole number of clock periods, and every N-th edge pulls
+  -- the head back to the seam. Two choices (the OptionControl limit is 3).
+  controls.sync = OptionControl {
+    description = "Clk input",
+    option      = objects.head:getOption("Sync"),
+    choices     = { "free", "sync" },
+    descriptionWidth = 2,
+  }
+  controls.bufferHeader = MenuHeader { description = "Loop buffer" }
   local cur = self.bufferSecs or kDefaultSecs
   local function bufTask(name, secs)
     local label = string.format("%d s", secs)
@@ -313,6 +418,8 @@ function Noether:onShowMenu(objects, branches)
     task = function() self:doAttachBufferFromPool() end }
   controls.editBuffer = Task { description = "Edit / save buffer",
     task = function() self:showSampleEditor() end }
+  controls.reloadLoop = Task { description = "Reload loop file",
+    task = function() self:loadLoopFromCard() end }
 
   local sub = {}
   if self.sample then
@@ -321,6 +428,8 @@ function Noether:onShowMenu(objects, branches)
                text = self.sample.name or "attached" }
     sub[3] = { position = app.GRID5_LINE3, justify = app.justifyLeft,
                text = string.format("%d s max", cur) }
+    sub[4] = { position = app.GRID5_LINE4, justify = app.justifyLeft,
+               text = "file: " .. (self.persistStatus or "none yet") }
   else
     sub[1] = { position = app.GRID5_LINE2, justify = app.justifyCenter,
                text = "No buffer" }
@@ -331,7 +440,7 @@ end
 -- ── views ───────────────────────────────────────────────────────────────
 -- The Reel is the in-context graphic for every control; the waveform view
 -- sits beside it in the expanded view (and is where the editor opens from).
-local controlOrder = { "rec", "ext", "speed", "voct", "start", "len", "sos", "dry", "level" }
+local controlOrder = { "rec", "undo", "stop", "clk", "ext", "speed", "voct", "sos", "dry", "level" }
 local views = { expanded = { "reel", "wave" }, collapsed = {} }
 for _, name in ipairs(controlOrder) do
   views.expanded[#views.expanded + 1] = name
@@ -348,6 +457,12 @@ function Noether:onLoadViews(objects, branches)
 
   controls.rec = Gate { button = "rec", description = "rec / close / overdub",
                         branch = branches.rec, comparator = objects.rec }
+  controls.undo = Gate { button = "undo", description = "undo last pass (again = redo)",
+                         branch = branches.undo, comparator = objects.undo }
+  controls.stop = Gate { button = "stop", description = "stop (latched): fades out, holds the head",
+                         branch = branches.stop, comparator = objects.stop }
+  controls.clk = Gate { button = "clk", description = "free: restart loop / sync: the clock",
+                        branch = branches.clk, comparator = objects.clk }
   controls.ext = Gate { button = "ext", description = "extend: overdub past the end grows the loop (latched)",
                         branch = branches.ext, comparator = objects.extg }
   controls.voct = Pitch {
@@ -367,11 +482,11 @@ function Noether:onLoadViews(objects, branches)
     }
   end
 
-  local speedMap = app.LinearDialMap(-4, 4); speedMap:setCoarseRadix(16)
-  gb("speed", "speed", "Speed: -4x .. 0 (stop) .. +4x", speedMap, 1.0,
-     app.LinearDialMap(-4, 4))
-  gb("start", "start", "Window start (fraction of loop)", Encoder.getMap("[0,1]"), 0.0)
-  gb("len",   "len",   "Window length (1 = whole loop)", Encoder.getMap("[0,1]"), 1.0)
+  -- -2..+2 with a coarse radix of 16: each coarse step is exactly 0.25, so
+  -- the coarse dial lands on 1/4, 1/2, 1, 2 (and 0) by itself
+  local speedMap = app.LinearDialMap(-2, 2); speedMap:setCoarseRadix(16)
+  gb("speed", "speed", "Speed: -2x .. 0 (stop) .. +2x", speedMap, 1.0,
+     app.LinearDialMap(-2, 2))
   gb("sos",   "sos",   "SOS: 0 replace .. 1 keep loop", Encoder.getMap("[0,1]"), 0.5)
   gb("dry",   "dry",   "Live input level", Encoder.getMap("[0,1]"), 1.0)
   gb("level", "level", "Loop level", Encoder.getMap("[0,1]"), 1.0)
