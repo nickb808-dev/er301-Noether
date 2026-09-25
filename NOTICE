@@ -1,0 +1,13 @@
+Noether — a seamless vari-speed loop recorder
+Copyright 2026 Nicholas Breinich (nickb808)
+
+Developed as a unit for the Orthogonal Devices ER-301 Sound Computer.
+
+If you distribute this software, a derivative of it, or a product that
+embeds it (including commercial hardware or software products), the
+Apache License 2.0 requires that this NOTICE file accompany the
+distribution — in your documentation, about screen, or wherever
+third-party notices normally appear.
+
+This project builds against the ER-301 SDK (© Orthogonal Devices, MIT
+License).
