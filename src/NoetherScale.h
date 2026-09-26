@@ -100,12 +100,21 @@ public:
         if (L > 0) {
             const int sec = h->getSections() > 0 ? h->getSections() : 1;
             const int cur = (int)((long)h->vizPos() * sec / L) + 1;
-            const int n = h->getSyncN();
-            if (n > 0 && h->hasClock()) snprintf(buf, sizeof buf, "%.2f s  %d/%d  N=%d", (double)h->getLoopSeconds(), cur, sec, n);
-            else                        snprintf(buf, sizeof buf, "%.2f s   %d/%d%s", (double)h->getLoopSeconds(), cur, sec, h->hasClock() ? "  clk" : "");
+            // clocked: bar X / Y (the edge phase over the loop's periods);
+            // otherwise the section the head is in
+            const int bars = h->getBars();
+            if (bars > 0 && h->hasClock()) snprintf(buf, sizeof buf, "%.2f s  bar %d/%d", (double)h->getLoopSeconds(), h->getBar(), bars);
+            else                           snprintf(buf, sizeof buf, "%.2f s   %d/%d%s", (double)h->getLoopSeconds(), cur, sec, h->hasClock() ? "  clk" : "");
             fb.text(GRAY9, x0 + 4, y0 + 4, buf, 10);
         } else {
-            fb.text(GRAY7, x0 + 4, y0 + 4, h->isArmed() ? "armed: waiting for clk" : (h->hasClock() ? "no loop   clk" : "no loop"), 10);
+            if (h->getBars() > 0) {
+                snprintf(buf, sizeof buf, "rec  bar %d/%d", h->getBar(), h->getBars());
+                fb.text(WHITE, x0 + 4, y0 + 4, buf, 10);
+            } else if (h->getState() == Noether::RECORD) {
+                fb.text(GRAY7, x0 + 4, y0 + 4, h->isArmed() ? "rec  (closes on clk)" : "rec", 10);
+            } else {
+                fb.text(GRAY7, x0 + 4, y0 + 4, h->isArmed() ? "armed: waiting for clk" : (h->hasClock() ? "no loop   clk" : "no loop"), 10);
+            }
         }
     }
 

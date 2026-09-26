@@ -25,9 +25,9 @@
  *      first kSeam samples (smoothstep), and the loop is shortened by kSeam. The
  *      sample after the loop's last sample is then literally the sample that
  *      was recorded next, so the wrap is continuous at any speed or direction.
- *   2. Every JUMP of the read head (a reset, a clock re-sync, a stop/start)
- *      fades a shadow head out over kSeam samples while the new position fades
- *      in — the FeedbackLooper jumpTo() idea.
+ *   2. Every JUMP of the read head (a free-mode clock reset, a sync-mode
+ *      downbeat re-sync) ramps the new position in over kJumpIn while a
+ *      shadow head tails the old material out over kJumpOut.
  *   3. Record level ramps (5 ms) on overdub in/out.
  *
  * EXTEND: with the ext gate latched on, an overdub that reaches the end of
@@ -41,8 +41,8 @@
  * on the UI thread so Lua can save it to the card at serialize time and
  * bring it back on deserialize (the stock loopers lose their loops).
  *
- * PHASE STATUS: 0.2.0 — phases 1 + 3 (less undo). Detents / scale graphic,
- * undo, clock and the end-of-loop output follow per the plan.
+ * STATUS: see memory.md. Slices / Start-Len windows were removed in 0.7.0;
+ * speed is capped at +/-2x.
  *
  * Named for Emmy Noether: a loop that is the same under every transformation.
  * Sibling to Dirac, Planck, Bohr and Landau. */
@@ -108,7 +108,7 @@ public:
     // out, extend, clear, import), so Lua saves only what changed.
     int  getLoopRev();
     // 1 while the effective speed sits on a musical ratio detent
-    // (+/-4, +/-2, +/-1, +/-1/2, +/-1/4, 0), else 0. For the display.
+    // (+/-2, +/-1, +/-1/2, +/-1/4, 0), else 0. For the display.
     int  getDetent();
     // Sections the display divides the loop into (8 until a clock exists).
     int  getSections();
@@ -129,6 +129,12 @@ public:
     int  isArmed();
     // 1 while a clock is present (an edge within the last 4 s).
     int  hasClock();
+    // Bars: the current bar (1-based) and the bar count, for the display —
+    // while recording under a bar count: bars taken so far / the count;
+    // while playing a clocked loop: the edge phase / the loop's periods.
+    // Both 0 when there is nothing to count.
+    int  getBar();
+    int  getBars();
 
 #ifndef SWIGLUA
     void process() override;
@@ -143,9 +149,10 @@ public:
     od::Inlet  mUndoIn   {"Undo"};     // trigger: swap the last pass out / back in
     od::Inlet  mClkIn    {"Clk"};      // trigger: free mode = restart the loop; sync mode = the clock
     od::Option mSyncOpt  {"Sync", 1};  // 1 = free, 2 = sync (never 0: CHOICE_UNKNOWN)
-    od::Inlet  mSpeedIn  {"Speed"};    // -4..+4, rate multiplier, 0 = stopped
+    od::Inlet  mSpeedIn  {"Speed"};    // -2..+2, rate multiplier, 0 = stopped
     od::Inlet  mVoctIn   {"V/Oct"};    // 1 V/oct into speed (ER-301: 1.0 = 10 oct)
     od::Inlet  mExtIn    {"Extend"};   // latched gate: overdub past the end grows the loop
+    od::Inlet  mBarsIn   {"Bars"};     // sync mode: close the take by itself after this many pulses (0 = manual)
     od::Inlet  mSosIn    {"SOS"};      // crossfader: 0 replace .. 1 keep loop
     od::Inlet  mDryIn    {"Dry"};      // dry (live input) level 0..1
     od::Inlet  mLevelIn  {"Level"};    // loop level 0..1
@@ -233,6 +240,7 @@ private:
     int    mSyncN = 0;            // clock periods per loop (0 = unknown)
     int    mEdgePhase = 0;        // edges since the last downbeat
     int    mArmed = 0;            // 0 none, 1 = start on next edge, 2 = stop on next edge
+    int    mBars = 0;             // the Bars inlet, rounded, read once per block
     int    mTailLeft = 0;         // frames of tail still to capture after a clocked close
     bool   mFirstTake = false;    // that tail's blend is not an undo-able pass
     // transport: stop gate high -> level ramps to 0 and the head holds
@@ -260,6 +268,7 @@ private:
     inline void cow(const float *d, int i)
     {
         if (!mpUndo || mRestoring || mState == RECORD || mFirstTake || i < 0 || i >= mBitsFrames) return;   // a first take has no undo
+        if (mpUndo->mChannelCount != (uint32_t)mNc) return;   // different layout: no undo, never an overrun
         if (bitGet(i)) return;
         float *u = mpUndo->mpData;
         if (!u || (uint32_t)i >= mpUndo->mSampleCount) return;

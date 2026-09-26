@@ -33,6 +33,7 @@
 #include <od/graphics/constants.h>
 #include "Noether.h"
 #include "NoetherLut.h"
+#include <cstdio>
 
 namespace noether {
 
@@ -92,7 +93,12 @@ public:
             // winding on: an arc from 12 o'clock, one turn per kWindSamples,
             // each further turn one step outward
             drawWinding(fb, cx, cy, R, h->vizWrite(), kWindSamples, WHITE);
-            if (!armed || strobe) centerWord(fb, WHITE, cx, cy, "REC", 10);
+            if (h->getBars() > 0) {
+                // a counted take: the bar count is the word (the ring
+                // winding says "recording" already)
+                snprintf(mBarBuf, sizeof mBarBuf, "%d/%d", h->getBar(), h->getBars());
+                centerWord(fb, WHITE, cx, cy, mBarBuf, 10);
+            } else if (!armed || strobe) centerWord(fb, WHITE, cx, cy, "REC", 10);
             mEnvRev = -1;
             return;
         }
@@ -268,6 +274,7 @@ public:
     int mEnvRev = -1, mEnvLen = 0, mCursor = 0, mPending = 0, mLastWrite = 0;
     unsigned mFrame = 0;
     int mWordW = 0, mWordSize = 0, mWordLen = 0;
+    char mBarBuf[16] = {0};
 #endif
 };
 

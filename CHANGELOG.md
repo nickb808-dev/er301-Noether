@@ -4,7 +4,34 @@ What changed for players, version by version, from 0.3.0 (the first build
 with the Reel) to the current release. The engineering detail behind each
 entry lives in `memory.md`.
 
-## 0.7.2 — current
+## 0.8.1 — current
+
+- **bars** actually reaches the engine. In 0.8.0 the control was connected
+  to an input the engine never opened, so a counted take would not have
+  closed itself (or the unit would not have added).
+- A counted take that you start while no clock is running now counts from
+  the moment you pressed **rec**, instead of closing on the first pulse when
+  the clock comes back.
+- A counted take longer than the buffer closes where the buffer ends and
+  no longer inherits the previous loop's bar count (which pulled the head
+  back to the start at the wrong moments).
+- A clocked take that ends right at the end of the buffer now gets its
+  seam, and overdubs on it can be undone.
+- **Attach pool buffer…** and preset loads rebuild the undo buffer to match
+  the loop buffer's length and channels. Undo on a mismatched buffer is
+  switched off rather than writing past the end of the undo buffer (a
+  possible crash in a mono chain with a stereo buffer attached).
+
+## 0.8.0
+
+- New **bars** control (0–64, takes CV). In *sync* mode with bars set, one
+  tap of **rec** records exactly that many clock pulses and closes the loop
+  by itself; the Reel counts 1/4, 2/4 … while it records and the sub display
+  reads *bar X/Y* as the loop plays (this replaces the old *N=* readout). A
+  second tap still closes early on the next pulse. Bars 0 is the manual
+  two-tap take as before; free mode and overdubs ignore it.
+
+## 0.7.2
 
 - Clear loop now also silences the buffer, so the waveform view goes flat
   along with the Reel instead of showing the old take.

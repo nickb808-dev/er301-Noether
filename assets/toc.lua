@@ -1,9 +1,9 @@
--- toc.lua — package manifest for noether v0.7.2
+-- toc.lua — package manifest for noether v0.8.1
 return {
   name    = "noether",
   title   = "Noether",
   author  = "nickb808",
-  version = "0.7.2",
+  version = "0.8.1",
   units   = {
     { title = "Noether", moduleName = "Noether", author = "nickb808" },
   },

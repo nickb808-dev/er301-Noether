@@ -1,0 +1,15 @@
+# Exclude Claude/Agent memory folders and local configurations
+MEMORY.md
+.claude/
+CLAUDE.local.md
+
+build/
+lib/
+test/t
+test/es
+*.o
+*.raw
+.DS_Store
+src/libnoether_wrap.cpp
+test/t_asan
+test/t_asan.dSYM/

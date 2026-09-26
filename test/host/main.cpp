@@ -1,7 +1,7 @@
 /* Host verification harness for Noether (no hardware).
  * Build: g++ -std=c++11 -O2 -ffast-math -Itest/host -Isrc \
  *          src/Noether.cpp test/host/main.cpp -o test/t
- * Modes: ident · length · seam · pulse · tri · speed · sos · extend · voct · persist ·
+ * Modes: ident · length · seam · pulse · tri · bars · speed · sos · extend · voct · persist ·
  *        detent · aa · viz · undo · stop · clock · nan · cpu · asan
  *
  * Every test prints the number it judged, not just PASS (standard §6/§10). */
@@ -39,7 +39,7 @@ static void setInputs(Noether &d, const Ctl *c, int n)
 {
     od::Inlet *ins[] = { &d.mLeftIn, &d.mRightIn, &d.mRecIn, &d.mSpeedIn,
                          &d.mSosIn, &d.mDryIn, &d.mLevelIn,
-                         &d.mVoctIn, &d.mExtIn,
+                         &d.mVoctIn, &d.mExtIn, &d.mBarsIn,
                          &d.mStopIn, &d.mUndoIn, &d.mClkIn };
     for (int i = 0; i < n; ++i) {
         bool matched = false;
@@ -55,9 +55,9 @@ static void setInputs(Noether &d, const Ctl *c, int n)
 static void base(Noether &d, float speed = 1.0f, float sos = 0.5f, float dry = 1.0f, float level = 1.0f)
 {
     Ctl c[] = {{"Speed", speed}, {"SOS", sos}, {"Dry", dry}, {"Level", level}, {"Rec", 0.0f},
-               {"V/Oct", 0.0f}, {"Extend", 0.0f},
+               {"V/Oct", 0.0f}, {"Extend", 0.0f}, {"Bars", 0.0f},
                {"Stop", 0.0f}, {"Undo", 0.0f}, {"Clk", 0.0f}};
-    setInputs(d, c, 10);
+    setInputs(d, c, 11);
 }
 
 // Feed `src` (mono, may be shorter than the block) through one block; a REC
@@ -973,6 +973,192 @@ static int t_clock()
 }
 
 // Poison every inlet with NaN / inf; output stays finite; unit recovers.
+// Bars (0.8.0): in sync mode with bars = N, one REC press arms, the take
+// starts on the next edge and closes itself after N edges (loop = N periods,
+// X/Y readouts count up); a second press still closes early; bars = 0 is the
+// manual two-press take; in free mode bars is ignored.
+static int t_bars()
+{
+    int fails = 0;
+    const int P = 12000;
+    auto setBars = [](Noether &d, float n) { Ctl c[] = {{"Bars", n}}; setInputs(d, c, 1); };
+    // ── counted take: 4 bars, one press ──
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        setBars(d, 4.2f);                              // rounds to 4
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        ClockRig rig(d, out, P);
+        rig.run(20, 0.3f);
+        long now = rig.t;
+        rig.run(1, 0.3f, now + 50);                    // REC: arms
+        int armed = d.isArmed();
+        rig.run(P / FRAMELENGTH + 2, 0.3f);            // edge: take starts
+        int st1 = d.getState(), bar1 = d.getBar(), bars1 = d.getBars();
+        rig.run(2 * P / FRAMELENGTH, 0.3f);            // two more edges
+        int bar3 = d.getBar();
+        rig.run(2 * P / FRAMELENGTH + 2, 0.3f);        // the 4th edge closes it by itself
+        int st2 = d.getState(), L = d.getLoopSamples(), N = d.getSyncN();
+        rig.run(P / FRAMELENGTH, 0.3f);                // one period into playback
+        int barP = d.getBar(), barsP = d.getBars();
+        bool ok = armed == 1 && st1 == 1 && bar1 == 1 && bars1 == 4 && bar3 == 3 &&
+                  st2 == 2 && L == 4 * P && N == 4 && barsP == 4 && (barP == 1 || barP == 2);
+        printf("bars: 4 bars, one press -> armed %d, recording %d (bar %d/%d), bar %d at 3rd edge, closed itself: state %d loop %d (expect %d) N %d, playing bar %d/%d  %s\n",
+               armed, st1, bar1, bars1, bar3, st2, L, 4 * P, N, barP, barsP, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── early close: 8 bars set, second press after 2 -> 3 periods ──
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        setBars(d, 8.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        ClockRig rig(d, out, P);
+        rig.run(20, 0.3f);
+        rig.run(1, 0.3f, rig.t + 50);
+        rig.run(P / FRAMELENGTH + 2, 0.3f);            // starts
+        rig.run(2 * P / FRAMELENGTH, 0.3f);            // 2 edges in
+        rig.run(1, 0.3f, rig.t + 30);                  // REC again: close on the next edge
+        int armed2 = d.isArmed();
+        rig.run(P / FRAMELENGTH + 2, 0.3f);
+        int st = d.getState(), L = d.getLoopSamples(), N = d.getSyncN();
+        bool ok = armed2 == 2 && st == 2 && L == 3 * P && N == 3;
+        printf("bars: 8 set, second press after 2 -> stop armed %d, loop %d = %d periods (expect 3), state %d  %s\n",
+               armed2, L, N, st, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── bars = 0: still recording after 6 edges (manual) ──
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        setBars(d, 0.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        ClockRig rig(d, out, P);
+        rig.run(20, 0.3f);
+        rig.run(1, 0.3f, rig.t + 50);
+        rig.run(P / FRAMELENGTH + 2, 0.3f);
+        rig.run(6 * P / FRAMELENGTH, 0.3f);
+        bool ok = d.getState() == 1 && d.getBars() == 0;
+        printf("bars: 0 -> still recording after 6 edges (state %d), no count shown (%d)  %s\n", d.getState(), d.getBars(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── free mode: bars ignored, REC is immediate, the take runs on ──
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        setBars(d, 2.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        ClockRig rig(d, out, P);
+        rig.run(20, 0.3f);
+        rig.run(1, 0.3f, rig.t + 50);
+        int st0 = d.getState();
+        rig.run(4 * P / FRAMELENGTH, 0.3f);
+        bool ok = st0 == 1 && d.getState() == 1 && d.getBars() == 0;
+        printf("bars: free mode, bars 2 -> immediate record (%d), still recording after 4 edges (%d)  %s\n", st0, d.getState(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 0.8.1: a take started with NO clock, then the clock arrives ──
+    // Before the fix the take inherited the edge count from an older clock,
+    // so bars closed it on the first edge with a nonsense N.
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        setBars(d, 4.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        { ClockRig rig(d, out, P); rig.run(20 * P / FRAMELENGTH, 0.3f); }   // 20 edges of history
+        std::vector<float> z(FRAMELENGTH, 0.3f);
+        for (int k = 0; k < 5 * kSR / FRAMELENGTH; ++k) block(d, z.data(), FRAMELENGTH, -1, out);  // 5 s: clock gone
+        block(d, z.data(), FRAMELENGTH, 10, out);      // REC with no clock: records at once
+        int st0 = d.getState(), bar0 = d.getBar();
+        ClockRig rig(d, out, P);                       // the clock comes back (edge at once)
+        rig.run(2, 0.3f);
+        int st1 = d.getState();
+        rig.run(3 * P / FRAMELENGTH + 2, 0.3f);        // three more edges: the 4th closes it
+        int st2 = d.getState(), N = d.getSyncN();
+        bool ok = st0 == 1 && bar0 <= 1 && st1 == 1 && st2 == 2 && N == 4;
+        printf("bars: take started with no clock, clock returns -> recording %d (bar %d), still recording after 1st edge %d, closed after 4th: state %d N %d  %s\n",
+               st0, bar0, st1, st2, N, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 0.8.1: a counted take that fills the buffer closes free, N = 0 ──
+    // Before the fix the previous loop's N survived and re-synced the new,
+    // unrelated loop every N edges.
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        setBars(d, 4.0f);
+        Buffer b(1, kSR * 2);                          // 8 periods of room
+        d.setSample(&b.s);
+        std::vector<float> out;
+        ClockRig rig(d, out, P);
+        rig.run(20, 0.3f);
+        rig.run(1, 0.3f, rig.t + 50);
+        rig.run(5 * P / FRAMELENGTH + 4, 0.3f);        // a 4-bar loop: N = 4
+        int N0 = d.getSyncN();
+        d.clearLoop();
+        rig.run(2, 0.3f);
+        setBars(d, 16.0f);                             // longer than the buffer
+        rig.run(1, 0.3f, rig.t + 50);
+        rig.run(10 * P / FRAMELENGTH, 0.3f);           // fills at 8 periods
+        int st = d.getState(), N1 = d.getSyncN(), armed = d.isArmed();
+        bool ok = N0 == 4 && st == 2 && N1 == 0 && armed == 0;
+        printf("bars: 16 bars into an 8-period buffer after a 4-bar loop -> state %d, N %d (was %d), armed %d  %s\n",
+               st, N1, N0, armed, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 0.8.1: a clocked close within kSeam of the buffer's end ──
+    // Before the fix the tail could never finish: seam unblended and every
+    // later overdub un-undoable (mFirstTake stuck).
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.0f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        setBars(d, 4.0f);
+        Buffer b(1, 4 * P + 50), ub(1, 4 * P + 50);   // 4 periods + 50 frames of room
+        d.setSample(&b.s);
+        d.setUndoSample(&ub.s);
+        std::vector<float> out;
+        ClockRig rig(d, out, P);
+        rig.run(20, 0.3f);
+        rig.run(1, 0.3f, rig.t + 50);
+        rig.run(5 * P / FRAMELENGTH + 4, 0.3f);        // closes at 4P, clamped
+        int st = d.getState(), L = d.getLoopSamples();
+        rig.run(4, 0.3f);
+        rig.run(1, 0.7f, rig.t + 10);                  // overdub in
+        rig.run(20, 0.7f);
+        rig.run(1, 0.7f, rig.t + 10);                  // overdub out
+        rig.run(10, 0.7f);
+        bool ok = st == 2 && L == 4 * P + 50 - Noether::kSeam - 1 && d.canUndo() == 1;
+        printf("bars: clocked close at the buffer's end -> state %d loop %d, overdub then canUndo %d  %s\n",
+               st, L, d.canUndo(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setUndoSample(nullptr);
+        d.setSample(nullptr);
+    }
+    return fails ? 1 : 0;
+}
+
 static int t_nan()
 {
     const float poisons[] = { NAN, INFINITY, -INFINITY };
@@ -1065,6 +1251,34 @@ static int t_asan()
         block(d, src.data(), FRAMELENGTH, 0, out);
         undoEdge(d, out);
     }
+    // 0.8.1: a mono unit holding a STEREO loop buffer and a MONO undo buffer
+    // (Attach pool buffer... in a mono chain). Undo must switch itself off,
+    // never index the mono buffer with the loop's two channels.
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.0f, 1.0f, 1.0f);
+        Buffer b(2, kSR / 2), ub(1, kSR / 2);
+        d.setSample(&b.s);
+        d.setUndoSample(&ub.s);
+        std::vector<float> out, src(FRAMELENGTH, 0.4f);
+        // the take must span MORE than half the buffer, so frame i * 2 of a
+        // stereo index lands past the end of the mono undo buffer
+        block(d, src.data(), FRAMELENGTH, 0, out);
+        for (int k = 0; k < 150; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
+        block(d, src.data(), FRAMELENGTH, 0, out);            // close
+        block(d, src.data(), FRAMELENGTH, -1, out);           // REC low: the next press is a new edge
+        block(d, src.data(), FRAMELENGTH, 0, out);            // overdub in
+        for (int k = 0; k < 170; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
+        const int dubState = d.getState();
+        block(d, src.data(), FRAMELENGTH, 0, out);            // overdub out
+        for (int k = 0; k < 10; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
+        d.mUndoIn.buffer()[0] = 1.0f; block(d, src.data(), FRAMELENGTH, -1, out); d.mUndoIn.buffer()[0] = 0.0f;
+        for (int k = 0; k < 10; ++k) block(d, src.data(), FRAMELENGTH, -1, out);
+        if (dubState != 3) { printf("asan: mismatch scenario never overdubbed (state %d)\n", dubState); ++bad; }
+        if (d.canUndo() != 0) { printf("asan: channel-mismatched undo buffer still reports canUndo\n"); ++bad; }
+        d.setUndoSample(nullptr);
+        d.setSample(nullptr);
+    }
     printf("asan: %d non-finite / out-of-range samples\n", bad);
     return bad ? 1 : 0;
 }
@@ -1079,6 +1293,7 @@ int main(int argc, char **argv)
     else if (!strcmp(m, "seam"))   r = t_seam();
     else if (!strcmp(m, "pulse"))  r = t_pulse();
     else if (!strcmp(m, "tri"))    r = t_tri();
+    else if (!strcmp(m, "bars"))   r = t_bars();
     else if (!strcmp(m, "extend")) r = t_extend();
     else if (!strcmp(m, "voct"))   r = t_voct();
     else if (!strcmp(m, "persist")) r = t_persist();

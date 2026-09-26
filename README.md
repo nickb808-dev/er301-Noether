@@ -6,9 +6,9 @@ button in the pedal-looper grammar, a loop that closes on the exact sample you
 pressed it and wraps without a click, and playback as a tape head: continuous
 speed from -2x to +2x, 0 = stopped, negative = reverse, pitch following speed.
 
-Unit title: **Noether** · mnemonic **Nt** · stereo · current version **0.7.2**
+Unit title: **Noether** · mnemonic **Nt** · stereo · current version **0.8.1**
 
-Named for Emmy Noether. Sibling to Dirac and Landau.
+Named for Emmy Noether. Sibling to Dirac, Planck, Bohr and Landau.
 
 ---
 
@@ -48,8 +48,11 @@ tape head with a 40 ms speed glide.
    *sync*: **rec** waits for the next pulse to start and to stop, so the
    loop is a whole number of clock periods (the reel's REC blinks while it
    waits), the section ticks become the beats, and every N-th pulse pulls
-   the head back to the downbeat even at 2x or in reverse. Unplug the clock
-   for four seconds and rec is immediate again.
+   the head back to the downbeat even at 2x or in reverse. Set **bars** to
+   4 and one tap does it all: the take starts on the next pulse and closes
+   itself after four (the reel counts 1/4, 2/4 … while it records; a second
+   tap still closes early). The sub display then reads *bar 2/4* as the
+   loop plays. Unplug the clock for four seconds and rec is immediate again.
 8. Quicksave or save the preset: the loop is written to
    `ER-301/noether/` on the card and comes back with the preset.
 9. The sub-display button under the waveform, or the menu, clears the loop.
@@ -78,6 +81,7 @@ semitone offset, the loop length and the section number.
 | undo | Undo | trigger | Swaps the last overdub / extend pass out (bit-exact, restored over a few blocks from the head outward); again = redo. A new pass replaces the undo point. |
 | stop | Stop | latched | Fades the loop out (5 ms) and holds the head; off resumes from the same place. Overdub writes pause while held. |
 | clk | Clk | trigger | Menu *free*: restart the loop. Menu *sync*: quantise rec to the clock, loop = N periods, re-sync every N-th pulse. |
+| bars | Bars | 0–64 / 0 | Sync mode only: with N > 0 one tap of rec records exactly N clock pulses and closes the loop by itself. 0 = manual (tap to start, tap to stop). Takes CV, so a sequencer can set the loop length. Ignored in free mode and for overdubs. |
 | ext | Extend | latched | While on, an overdub past the loop end grows the loop (recorded at 1x, loop playing underneath). |
 | speed | Speed | −2…+2 / 1 | Playback rate. 0 stops, negative reverses, pitch follows. Coarse steps of 0.25, fine below. Glides over 40 ms. Magnetic detents within 3 % of 1/4, 1/2, 1, 2 and 0. Above 1x a gentle anti-alias filter engages. |
 | V/oct | V/Oct | 1 V/oct / 0 | Summed into speed as octaves: 1 V doubles it (capped at 2x). |
@@ -114,6 +118,6 @@ anti-alias filter if 2x sounds harsh.
 Same as Landau: `make docker-image`, `make swig-docker ER301_SDK=~/er-301`,
 `make docker-build ER301_SDK=~/er-301`, `make pkg`. Or natively on Linux with
 `make swig build TOOLCHAIN=native ER301_SDK=...`. `make hosttest` runs the
-host harness (ident · length · seam · pulse · tri · speed · sos · extend · voct · persist · detent · aa · viz · undo · stop · clock · nan · cpu · asan).
+host harness (ident · length · seam · pulse · tri · bars · speed · sos · extend · voct · persist · detent · aa · viz · undo · stop · clock · nan · cpu · asan).
 
 Apache-2.0. See LICENSE and NOTICE.

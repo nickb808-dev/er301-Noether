@@ -33,7 +33,7 @@ local libnoether = require "noether.libnoether"
 
 -- THE RUNNING VERSION, ON SCREEN (standard §10c). tools/check-version.sh
 -- fails the build if this drifts from the Makefile or toc.lua.
-local VERSION = "0.7.2"
+local VERSION = "0.8.1"
 
 -- Default loop buffer length. Changed from the menu (10 / 30 / 60 s).
 local kDefaultSecs = 30
@@ -114,6 +114,10 @@ function Noether:onLoadGraph(channelCount)
   self:addMonoBranch("voct", tune, "In", tune, "Out")
 
   param(self, head, "speed", "Speed", 1.0)
+  -- BARS: sync mode, a counted take — rec once, the loop starts on the next
+  -- pulse and closes itself after this many pulses (0 = manual, as before).
+  -- A CV-able integer parameter like the stock Clocked Delay's mult / div.
+  param(self, head, "bars",  "Bars",  0.0)
   param(self, head, "sos",   "SOS",   0.5)
   param(self, head, "dry",   "Dry",   1.0)
   param(self, head, "level", "Level", 1.0)
@@ -182,16 +186,27 @@ function Noether:createBuffer(secs)
     Overlay.flashMainMessage("Buffer failed: %s", msg or "?")
     return
   end
+  self:matchUndoBuffer(sample)
+end
+
+-- The undo buffer must match the loop buffer frame for frame: the same
+-- channel count (the engine switches undo off rather than index a mono undo
+-- buffer as stereo) and the same length (frames past its end cannot be
+-- undone). So it is rebuilt from the loop buffer whenever that changes:
+-- a new buffer, an attached pool buffer, a preset load.
+function Noether:matchUndoBuffer(sample)
+  if not sample then
+    self:setUndoBuffer(nil)
+    return
+  end
   local usample = SamplePool.create {
     root = "noether-undo",
-    channels = self.channelCount,
-    secs = secs
+    channels = sample:getChannelCount(),
+    samples = sample:length()
   }
-  if usample then
-    self:setUndoBuffer(usample)
-  else
-    self:setUndoBuffer(nil)
-    Overlay.flashMainMessage("No memory for undo (%d s)", secs)
+  self:setUndoBuffer(usample)
+  if not usample then
+    Overlay.flashMainMessage("No memory for undo")
   end
 end
 
@@ -214,6 +229,7 @@ function Noether:doAttachBufferFromPool()
   chooser:subscribe("done", function(sample)
     if sample then
       self:setSample(sample)
+      self:matchUndoBuffer(sample)
       Overlay.flashMainMessage("Attached buffer: %s", sample.name)
     end
   end)
@@ -352,13 +368,7 @@ function Noether:deserialize(t)
     local sample = SamplePool.deserializeSample(t.sample, self.chain)
     if sample then
       self:setSample(sample)
-      -- the undo buffer follows the loop buffer's size
-      local usample = SamplePool.create {
-        root = "noether-undo",
-        channels = self.channelCount,
-        secs = self.bufferSecs or kDefaultSecs
-      }
-      self:setUndoBuffer(usample or nil)
+      self:matchUndoBuffer(sample)
     else
       app.logError("%s:deserialize: failed to load sample.", self)
     end
@@ -440,7 +450,7 @@ end
 -- ── views ───────────────────────────────────────────────────────────────
 -- The Reel is the in-context graphic for every control; the waveform view
 -- sits beside it in the expanded view (and is where the editor opens from).
-local controlOrder = { "rec", "undo", "stop", "clk", "ext", "speed", "voct", "sos", "dry", "level" }
+local controlOrder = { "rec", "undo", "stop", "clk", "bars", "ext", "speed", "voct", "sos", "dry", "level" }
 local views = { expanded = { "reel", "wave" }, collapsed = {} }
 for _, name in ipairs(controlOrder) do
   views.expanded[#views.expanded + 1] = name
@@ -461,7 +471,7 @@ function Noether:onLoadViews(objects, branches)
                          branch = branches.undo, comparator = objects.undo }
   controls.stop = Gate { button = "stop", description = "stop (latched): fades out, holds the head",
                          branch = branches.stop, comparator = objects.stop }
-  controls.clk = Gate { button = "clk", description = "free: restart loop / sync: the clock",
+  controls.clk = Gate { button = "clk", description = "free: restart loop / sync: the clock (bars counts its pulses)",
                         branch = branches.clk, comparator = objects.clk }
   controls.ext = Gate { button = "ext", description = "extend: overdub past the end grows the loop (latched)",
                         branch = branches.ext, comparator = objects.extg }
@@ -487,6 +497,15 @@ function Noether:onLoadViews(objects, branches)
   local speedMap = app.LinearDialMap(-2, 2); speedMap:setCoarseRadix(16)
   gb("speed", "speed", "Speed: -2x .. 0 (stop) .. +2x", speedMap, 1.0,
      app.LinearDialMap(-2, 2))
+  -- whole bars: rounding 1 snaps every step to an integer, coarse radix 64
+  -- makes a coarse click exactly one bar over the 0..64 range
+  local barsMap = app.LinearDialMap(0, 64); barsMap:setRounding(1); barsMap:setCoarseRadix(64)
+  controls.bars = GainBias {
+    button = "bars", description = "sync: close the take after N pulses (0 = manual)",
+    branch = branches.bars, gainbias = objects.barsParam, range = objects.barsRange,
+    biasMap = barsMap, biasPrecision = 0, initialBias = 0,
+    gainMap = app.LinearDialMap(-64, 64),
+  }
   gb("sos",   "sos",   "SOS: 0 replace .. 1 keep loop", Encoder.getMap("[0,1]"), 0.5)
   gb("dry",   "dry",   "Live input level", Encoder.getMap("[0,1]"), 1.0)
   gb("level", "level", "Loop level", Encoder.getMap("[0,1]"), 1.0)
