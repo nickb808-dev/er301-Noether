@@ -6,7 +6,7 @@ button in the pedal-looper grammar, a loop that closes on the exact sample you
 pressed it and wraps without a click, and playback as a tape head: continuous
 speed from -2x to +2x, 0 = stopped, negative = reverse, pitch following speed.
 
-Unit title: **Noether** · mnemonic **Nt** · stereo · current version **0.8.1**
+Unit title: **Noether** · mnemonic **Nt** · stereo · current version **0.8.3**
 
 Named for Emmy Noether. Sibling to Dirac, Planck, Bohr and Landau.
 

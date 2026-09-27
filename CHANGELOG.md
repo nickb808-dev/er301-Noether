@@ -4,7 +4,34 @@ What changed for players, version by version, from 0.3.0 (the first build
 with the Reel) to the current release. The engineering detail behind each
 entry lives in `memory.md`.
 
-## 0.8.1 — current
+## 0.8.3 — current
+
+- **What you hear while overdubbing is clean.** The overdub used to write at
+  the play head and then read that spot straight back. So while DUB was on,
+  you heard a second copy of your input with a grainy, sample-rate-reduced
+  quality (and at 1x the input came through twice as loud). The write head
+  now trails the play head by 3 samples, like the gap between tape heads:
+  you hear the loop as it was plus your live input. What gets recorded is
+  unchanged.
+- Very quiet loop tails no longer turn into denormal numbers, which the
+  ER-301's processor handles very slowly. This happened when overdubbing
+  over silence for several minutes.
+
+## 0.8.2
+
+- **Overdubbing at any speed other than 1x no longer degrades the loop.**
+  An overdub used to write to the nearest sample under the head. Below 1x
+  several input samples landed on the same spot, so SOS was applied two
+  (0.5x) or four (0.25x) times per pass and the input was sampled down with
+  no filter. Above 1x, spots were skipped and never faded. It sounded like
+  a sample-rate mismatch that got worse with every pass. The head now writes
+  every spot it passes exactly once, like tape, with the input filtered
+  below 1x. At exactly 1x nothing changes.
+- **The speed glide now lands exactly on its target.** After any speed
+  change, "1x" used to settle at 0.9999x, which made the head drift and
+  set off the problem above even when the dial read 1.
+
+## 0.8.1
 
 - **bars** actually reaches the engine. In 0.8.0 the control was connected
   to an input the engine never opened, so a counted take would not have

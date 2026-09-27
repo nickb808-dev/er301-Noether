@@ -106,6 +106,7 @@ void Noether::beginPass()
 {
     if (mRestoring) return;
     clearUndo();
+    mWValid = false;
     mUndoLenA = mLoopLen;
     mUndoLenB = mLoopLen;
 }
@@ -131,6 +132,7 @@ void Noether::beginUndo()
     const int newLen = (mLoopLen == mUndoLenA) ? mUndoLenB : mUndoLenA;
     if (newLen > 0 && newLen <= mCap) {
         mLoopLen = newLen;
+        mWValid = false;
         if (mRead >= (double)newLen) mRead = 0.0;
         mJumpCount = 0;
     }
@@ -314,6 +316,7 @@ void Noether::enterEmpty()
     clearUndo();
     mRestoring = false;
     mTailLeft = 0; mFirstTake = false;
+    mWValid = false;
     mState = EMPTY;
     if (mLoopLen > 0) ++mLoopRev;
     mLoopLen = 0;
@@ -517,11 +520,59 @@ int Noether::findSeam(const float *d, int hi) const
     return LBest;
 }
 
+// The overdub write head (0.8.2). Until 0.8.1 an overdub wrote the input to
+// the NEAREST frame at the read head: exact at 1x, but below 1x several
+// input samples landed on one frame (SOS applied two, four ... times per
+// pass, the input decimated with no filter) and above 1x frames were
+// skipped (never decayed). Heard as "sample rate mismatch" that grows with
+// every pass. Now every frame the head CROSSES between the previous sample
+// and this one is written exactly once, with the input interpolated to the
+// moment of the crossing — a tape head, not a sample-and-hold. At exactly
+// 1x the crossing is this sample (tau = 1), bit-identical to the old write.
+// No floor(): the positions are >= 0, so an int cast is the floor.
+void Noether::dubWrite(float *d, double pos, int L, float xl, float xr, float sos)
+{
+    const float g = mRecLvl;
+    double dp = pos - mWPos;
+    if (dp > 0.5 * (double)L) dp -= (double)L;
+    else if (dp < -0.5 * (double)L) dp += (double)L;
+    if (!mWValid || dp > 4.0 || dp < -4.0) {
+        // first sample of a pass, or after a jump: the frame under the head
+        int wi = (int)(pos + 0.5);
+        if (wi >= L) wi -= L;
+        dubCell(d, wi, xl, xr, g, sos);
+    } else if (dp > 0.0) {
+        const double inv = 1.0 / dp;
+        for (int c = (int)mWPos + 1, k = 0; k < 4; ++c, ++k) {
+            const double reach = (double)c - mWPos;          // (0, dp]
+            if (reach > dp) break;
+            const float tau = (float)(reach * inv);
+            const int ci = c >= L ? c - L : c;
+            dubCell(d, ci, mXpL * (1.0f - tau) + xl * tau, mXpR * (1.0f - tau) + xr * tau, g, sos);
+        }
+    } else if (dp < 0.0) {
+        const double inv = -1.0 / dp;
+        int c = (int)mWPos;
+        if ((double)c == mWPos) --c;                          // the largest frame BELOW
+        for (int k = 0; k < 4; --c, ++k) {
+            const double reach = mWPos - (double)c;          // (0, -dp]
+            if (reach > -dp) break;
+            const float tau = (float)(reach * inv);
+            const int ci = c < 0 ? c + L : c;
+            dubCell(d, ci, mXpL * (1.0f - tau) + xl * tau, mXpR * (1.0f - tau) + xr * tau, g, sos);
+        }
+    }
+    mWPos = pos;
+    mXpL = xl; mXpR = xr;
+    mWValid = true;
+}
+
 // A jump of the read head: the new position ramps in over kJumpIn while a
 // shadow head (absolute loop position) keeps playing the old material and
 // tails out over kJumpOut (capped at half the loop for very short loops).
 void Noether::beginJump(double toWindowPhase, double shadowAbs)
 {
+    mWValid = false;
     mShadow = shadowAbs;
     mRead = toWindowPhase;
     int out = kJumpOut;
@@ -618,6 +669,15 @@ void Noether::process()
         const float sp = mSpeedZ < 0.0f ? -mSpeedZ : mSpeedZ;
         if (sp > 1.0f) aAa = 1.0f - expf(-3.14159265f / sp);   // 2*pi*fc, fc = 0.5/sp cycles/sample
     }
+    // overdub input anti-alias: below 1x the buffer is COARSER than the input
+    // (1/|speed| input samples per frame), so the input is low-passed at the
+    // buffer's Nyquist (0.5 |speed| cycles/sample) by two one-poles; exactly
+    // 1 (a bypass) at and above 1x, where the write interpolates instead
+    float aW = 1.0f;
+    {
+        const float sp = mSpeedZ < 0.0f ? -mSpeedZ : mSpeedZ;
+        if (sp < 1.0f) aW = 1.0f - expf(-3.14159265f * sp);
+    }
     const float sos    = clampf(sanitize(mSosIn.buffer()[0]), 0.0f, 1.0f);
     const float dry    = clampf(sanitize(mDryIn.buffer()[0]), 0.0f, 1.0f);
     const float level  = clampf(sanitize(mLevelIn.buffer()[0]), 0.0f, 1.0f);
@@ -647,6 +707,16 @@ void Noether::process()
     if (!(mDryZ >= 0.0f && mDryZ <= 1.0f)) mDryZ = dry;
     if (!(mAaL > -8.0f && mAaL < 8.0f)) mAaL = 0.0f;
     if (!(mAaR > -8.0f && mAaR < 8.0f)) mAaR = 0.0f;
+    if (!(mWl1 > -8.0f && mWl1 < 8.0f && mWl2 > -8.0f && mWl2 < 8.0f)) { mWl1 = mWl2 = 0.0f; }
+    if (!(mWr1 > -8.0f && mWr1 < 8.0f && mWr2 > -8.0f && mWr2 < 8.0f)) { mWr1 = mWr2 = 0.0f; }
+    if (!(mXpL > -8.0f && mXpL < 8.0f)) mXpL = 0.0f;
+    if (!(mXpR > -8.0f && mXpR < 8.0f)) mXpR = 0.0f;
+    // denormal guard on every recursive state (see flushTiny)
+    mAaL = flushTiny(mAaL); mAaR = flushTiny(mAaR);
+    mWl1 = flushTiny(mWl1); mWl2 = flushTiny(mWl2);
+    mWr1 = flushTiny(mWr1); mWr2 = flushTiny(mWr2);
+    mDryZ = flushTiny(mDryZ); mRecLvl = flushTiny(mRecLvl);
+    if (!(mWPos >= 0.0 && mWPos < (double)(mLoopLen > 0 ? mLoopLen : 1))) mWValid = false;
 
     float prevRec = mPrevRec, prevUndo = mPrevUndo, prevClk = mPrevClk;
     mStopped = stopGate;
@@ -700,7 +770,15 @@ void Noether::process()
         if (mState == OVERDUB && mRecGoal == 0.0f && mRecLvl == 0.0f) { mState = PLAY; ++mLoopRev; mUndoLenB = mLoopLen; }
 
         // ── speed glide ──
-        mSpeedZ += aGlide * (speedT - mSpeedZ);
+        // A float one-pole never ARRIVES: once a * gap is under half an ulp
+        // of the speed, it stalls ~1e-4 short (a "1x" of 0.99989 — measured),
+        // and the head then drifts across frames forever. Snap the last 2e-4
+        // (0.35 cents) so a detent is exactly its ratio again.
+        {
+            const float gap = speedT - mSpeedZ;
+            if (gap < 2.0e-4f && gap > -2.0e-4f) mSpeedZ = speedT;
+            else mSpeedZ += aGlide * gap;
+        }
 
         float yl = 0.0f, yr = 0.0f;   // loop output
         switch (mState) {
@@ -767,17 +845,24 @@ void Noether::process()
             // record ramp so punching in/out never steps the existing audio
             if (mState == OVERDUB && mRecLvl > 0.0f && !held &&
                 (mSpeedZ > kSpeedStop || mSpeedZ < -kSpeedStop)) {
-                int wi = (int)(pos + 0.5);
-                if (wi >= L) wi -= L;
-                cow(d, wi);
-                float *w = d + (size_t)wi * mNc;
-                const float g = mRecLvl;
-                float nl = sos * w[0] + (1.0f - sos) * xl;
-                w[0] = softLimit(w[0] + g * (nl - w[0]));
-                if (mNc > 1) {
-                    float nr = sos * w[1] + (1.0f - sos) * xr;
-                    w[1] = softLimit(w[1] + g * (nr - w[1]));
-                }
+                float il = xl, ir = xr;
+                if (aW < 1.0f) {
+                    mWl1 += aW * (il - mWl1); mWl2 += aW * (mWl1 - mWl2); il = mWl2;
+                    mWr1 += aW * (ir - mWr1); mWr2 += aW * (mWr1 - mWr2); ir = mWr2;
+                } else { mWl1 = mWl2 = il; mWr1 = mWr2 = ir; }
+                // HEAD GAP: the write head trails the play head by kHeadGap
+                // frames (ahead of it in reverse), so every frame the Hermite
+                // read touches (-1 .. +2) still holds the loop as it was
+                // before this pass. Until 0.8.2 the write landed AT the play
+                // head and was read straight back: what you heard while
+                // dubbing carried a second, decimated copy of the input.
+                double wpos = mSpeedZ > 0.0f ? pos - (double)kHeadGap : pos + (double)kHeadGap;
+                if (wpos < 0.0) wpos += (double)L;
+                else if (wpos >= (double)L) wpos -= (double)L;
+                if (!(wpos >= 0.0 && wpos < (double)L)) wpos = 0.0;   // loops shorter than the gap
+                dubWrite(d, wpos, L, il, ir, sos);
+            } else {
+                mWValid = false;
             }
 
             yl = readHermite(d, pos, 0);

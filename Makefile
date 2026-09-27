@@ -37,7 +37,7 @@ TOOLCHAIN ?= docker
 
 PKG     := noether
 MODULE  := libnoether
-VERSION := 0.8.1
+VERSION := 0.8.3
 ARCH    := am335x
 
 SRCDIR  := src
@@ -340,7 +340,7 @@ hosttest: check-api check-ports check-version check-lua
 	g++ -std=c++11 -O2 -ffast-math -Itest/host -Isrc src/Noether.cpp test/host/main.cpp -o test/t
 	./test/t ident && ./test/t length && ./test/t seam && ./test/t pulse && ./test/t tri && ./test/t speed \
 	  && ./test/t sos && ./test/t extend && ./test/t voct && ./test/t persist \
-	  && ./test/t detent && ./test/t aa && ./test/t viz && ./test/t undo && ./test/t stop && ./test/t clock && ./test/t bars \
+	  && ./test/t detent && ./test/t aa && ./test/t viz && ./test/t undo && ./test/t stop && ./test/t clock && ./test/t bars && ./test/t dub \
 	  && ./test/t nan && ./test/t cpu
 	g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Itest/host -Isrc \
 	  src/Noether.cpp test/host/main.cpp -o test/t_asan

@@ -33,7 +33,7 @@ local libnoether = require "noether.libnoether"
 
 -- THE RUNNING VERSION, ON SCREEN (standard §10c). tools/check-version.sh
 -- fails the build if this drifts from the Makefile or toc.lua.
-local VERSION = "0.8.1"
+local VERSION = "0.8.3"
 
 -- Default loop buffer length. Changed from the menu (10 / 30 / 60 s).
 local kDefaultSecs = 30

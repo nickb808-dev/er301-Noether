@@ -188,6 +188,7 @@ public:
     static constexpr float kSpeedStop   = 0.05f; // |speed| below = stopped
     static constexpr float kRecRampSec  = 0.005f;
     static constexpr float kGlideSec    = 0.040f; // speed glide (tape slide)
+    static constexpr int   kHeadGap     = 3;      // overdub writes this many frames BEHIND the play head
 
 private:
     static constexpr int   kSampleRate  = 48000;
@@ -227,6 +228,13 @@ private:
     bool   mDetent = false;
     // anti-alias one-pole on the read (|speed| > 1 only; a = 1 is a bypass)
     float  mAaL = 0.0f, mAaR = 0.0f;
+    // overdub write head (0.8.2): the loop position written up to on the
+    // previous sample, the previous (filtered) input, and a two-pole input
+    // low-pass used below 1x (a = 1 is a bypass)
+    double mWPos = 0.0;
+    bool   mWValid = false;
+    float  mXpL = 0.0f, mXpR = 0.0f;
+    float  mWl1 = 0.0f, mWl2 = 0.0f, mWr1 = 0.0f, mWr2 = 0.0f;
     // record level ramp (overdub in/out)
     float  mRecLvl = 0.0f, mRecGoal = 0.0f;
     float  mPrevRec = 0.0f;    // last Rec sample of the previous block
@@ -280,6 +288,19 @@ private:
         bitSet(i);
         mUndoAvail = true;
     }
+    // One overdub write into loop frame c: the SOS crossfade at record level g.
+    inline void dubCell(float *d, int c, float xl, float xr, float g, float sos)
+    {
+        cow(d, c);
+        float *w = d + (size_t)c * mNc;
+        const float nl = sos * w[0] + (1.0f - sos) * xl;
+        w[0] = flushTiny(softLimit(w[0] + g * (nl - w[0])));
+        if (mNc > 1) {
+            const float nr = sos * w[1] + (1.0f - sos) * xr;
+            w[1] = flushTiny(softLimit(w[1] + g * (nr - w[1])));
+        }
+    }
+    void dubWrite(float *d, double pos, int L, float xl, float xr, float sos);
     void onClockEdge();        // audio thread, at the edge sample
     void blendSeam(float *d, int L);
     void closeLoopExact();     // clocked close: exact length + deferred tail
@@ -328,6 +349,14 @@ private:
         }
         locked = false;
         return s;
+    }
+    // Denormals: an overdub at SOS < 1 over digital silence decays the loop
+    // by SOS every pass, into the denormal range after ~126 passes at 0.5
+    // (host soak: every frame of a 2 s loop denormal at 4.5 min), and the
+    // A8's VFP handles denormals slowly. Anything under 1e-30 (-600 dB) is 0.
+    static inline float flushTiny(float x)
+    {
+        return (x < 1.0e-30f && x > -1.0e-30f) ? 0.0f : x;
     }
     static inline float clampf(float x, float lo, float hi)
     {

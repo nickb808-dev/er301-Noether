@@ -105,6 +105,8 @@ static void recordSine(Noether &d, double freq, int frames, int edge0, std::vect
     }
 }
 
+static int kRecRampFrames() { return (int)(kSR * Noether::kRecRampSec + 0.5f); }
+
 static double maxAbsDiff(const std::vector<float> &x, size_t from, size_t to)
 {
     double m = 0.0;
@@ -1159,6 +1161,174 @@ static int t_bars()
     return fails ? 1 : 0;
 }
 
+// Overdub at any speed (0.8.2). Until 0.8.1 an overdub wrote the NEAREST
+// frame: below 1x one frame took several input samples (SOS applied two,
+// four ... times a pass, input decimated), above 1x frames were skipped —
+// "sample rate mismatch" that grew with every pass. And the speed glide
+// stalled ~1e-4 short of a detent, so "1x" drifted across frames.
+static double sineSnrDb(const std::vector<float> &x, size_t from, size_t to, double f)
+{
+    double ss = 0, sc = 0, cc = 0, xs = 0, xc = 0;
+    for (size_t i = from; i < to; ++i) {
+        const double w = 2 * kPi * f * (double)i / kSR, sn = sin(w), cs = cos(w);
+        ss += sn * sn; cc += cs * cs; sc += sn * cs; xs += x[i] * sn; xc += x[i] * cs;
+    }
+    const double det = ss * cc - sc * sc, a = (xs * cc - xc * sc) / det, b = (xc * ss - xs * sc) / det;
+    double sig = 0, res = 0;
+    for (size_t i = from; i < to; ++i) {
+        const double w = 2 * kPi * f * (double)i / kSR, y = a * sin(w) + b * cos(w), e = x[i] - y;
+        sig += y * y; res += e * e;
+    }
+    return 10 * log10(sig / (res + 1e-30));
+}
+
+static int t_dub()
+{
+    int fails = 0;
+    // ── 1. the glide arrives: 1 -> 0.5 -> 1 ends at EXACTLY 1 ──
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 1.0f, 1.0f);
+        Buffer b(1, kSR);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        recordSine(d, 300.0, 9600, 3, out);
+        Ctl h[] = {{"Speed", 0.5f}}; setInputs(d, h, 1); silentBlocks(d, 200, out);
+        const float s05 = d.getSpeed();
+        Ctl o[] = {{"Speed", 1.0f}}; setInputs(d, o, 1); silentBlocks(d, 200, out);
+        const float s1 = d.getSpeed();
+        const bool ok = s05 == 0.5f && s1 == 1.0f;
+        printf("dub: glide 1 -> 0.5 -> 1 settles at %.9f / %.9f (must be exact)  %s\n", (double)s05, (double)s1, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 2. SOS is applied ONCE per pass at any speed: a DC 0.5 loop,
+    //       silence overdubbed at SOS 0.5 for part of a pass -> every frame
+    //       the head crossed is 0.25 (never 0.125 = twice), with no holes ──
+    for (float sp : {0.5f, 0.25f, 0.7f, 1.5f, 2.0f, -0.5f, -2.0f}) {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 1.0f, 1.0f);
+        Buffer b(1, kSR);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        std::vector<float> dc(FRAMELENGTH, 0.5f), z(FRAMELENGTH, 0.0f);
+        block(d, dc.data(), FRAMELENGTH, 0, out);
+        for (int k = 0; k < 150; ++k) block(d, dc.data(), FRAMELENGTH, -1, out);
+        block(d, dc.data(), FRAMELENGTH, 0, out);                  // a DC 0.5 loop
+        const int L = d.getLoopSamples();
+        Ctl c[] = {{"Speed", sp}}; setInputs(d, c, 1);
+        silentBlocks(d, 100, out);
+        block(d, z.data(), FRAMELENGTH, -1, out);
+        block(d, z.data(), FRAMELENGTH, 0, out);                   // overdub silence in
+        const int blocks = (int)(0.4 * L / fabs(sp)) / FRAMELENGTH; // ~40 % of a pass
+        for (int k = 0; k < blocks; ++k) block(d, z.data(), FRAMELENGTH, -1, out);
+        block(d, z.data(), FRAMELENGTH, 0, out);                   // out
+        silentBlocks(d, 4, out);
+        int quarter = 0, twice = 0, other = 0, holes = 0;
+        for (int i = 0; i < L; ++i) {
+            const float v = b.data[i];
+            if (fabs(v - 0.25f) < 1e-6f) ++quarter;
+            else if (fabs(v - 0.125f) < 1e-3f) ++twice;
+            else if (fabs(v - 0.5f) > 1e-6f) ++other;     // the 5 ms ramps at the punch points
+            if (i > 0 && i + 1 < L && fabs(v - 0.5f) < 1e-6f &&
+                fabs(b.data[i - 1] - 0.25f) < 1e-6f && fabs(b.data[i + 1] - 0.25f) < 1e-6f) ++holes;
+        }
+        const int ramp = (int)(2 * kRecRampFrames() * fabs(sp)) + 8;
+        const bool ok = twice == 0 && holes == 0 && quarter > (int)(0.3 * L) && other <= ramp;
+        printf("dub: SOS once per pass at %5.2fx -> %d frames at 0.25, %d at 0.125 (twice), %d holes, %d in the ramps (<= %d)  %s\n",
+               (double)sp, quarter, twice, holes, other, ramp, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 3. purity: a tone overdubbed at speed s (SOS 0, several passes)
+    //       plays back at s as a clean tone ──
+    for (float sp : {1.0f, 0.5f, 0.25f, 0.7f, 1.5f, 2.0f, -1.0f, -0.5f}) {
+        Noether d(1);
+        base(d, 1.0f, 0.0f, 0.0f, 1.0f);
+        Buffer b(1, kSR * 2);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        recordSine(d, 0.0, 24000, 3, out, 0.0);
+        const int L = d.getLoopSamples();
+        const double as = fabs((double)sp);
+        const double f = floor(700.0 / as * L / kSR + 0.5) * kSR * as / L;   // whole cycles per loop in the buffer
+        Ctl c[] = {{"Speed", sp}}; setInputs(d, c, 1);
+        silentBlocks(d, 200, out);
+        std::vector<float> src(FRAMELENGTH); long t = 0;
+        auto feed = [&](int edge) {
+            for (int i = 0; i < FRAMELENGTH; ++i, ++t) src[i] = (float)(0.5 * sin(2 * kPi * f * (double)t / kSR));
+            block(d, src.data(), FRAMELENGTH, edge, out);
+        };
+        const int blocks = (int)(3.0 * L / as) / FRAMELENGTH;       // three passes
+        feed(0);
+        for (int k = 0; k < blocks; ++k) feed(-1);
+        feed(0);
+        for (int k = 0; k < 20; ++k) feed(-1);                       // through the punch-out ramp
+        std::vector<float> pb;
+        silentBlocks(d, 2 * kSR / FRAMELENGTH, pb);
+        const double snr = sineSnrDb(pb, 4800, pb.size(), f);
+        const double need = (sp == 1.0f || sp == -1.0f) ? 100.0 : 55.0;
+        const bool ok = snr >= need;
+        printf("dub: tone overdubbed and played at %5.2fx -> %6.1f dB SNR (>= %.0f)  %s\n", (double)sp, snr, need, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 4. AUDITION while dubbing (0.8.2, the device report "only when DUB
+    //       is active ... sound records properly"): onto a SILENT loop, the
+    //       first pass must sound like the dry input and nothing else. With
+    //       the write AT the play head it carried a second, decimated copy
+    //       of the input read straight back (-4 .. -6 dB below 1x; 0 dB,
+    //       i.e. the input doubled, at 1x). The head gap fixes it. ──
+    for (float sp : {1.0f, 0.5f, 0.25f, 2.0f, -1.0f, -0.5f}) for (int glide = 0; glide < 2; ++glide) {
+        Noether d(1);
+        base(d, 1.0f, 0.0f, 1.0f, 1.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        recordSine(d, 0.0, 3 * kSR, 3, out, 0.0);
+        if (glide) { Ctl g[] = {{"Speed", 0.6f}}; setInputs(d, g, 1); silentBlocks(d, 5, out); }   // a fractional head
+        Ctl c[] = {{"Speed", sp}}; setInputs(d, c, 1);
+        silentBlocks(d, 200, out);
+        std::vector<float> src(FRAMELENGTH), o; long t = 0; double e = 0, x2 = 0;
+        for (int k = 0; k < 300; ++k) {
+            for (int i = 0; i < FRAMELENGTH; ++i, ++t) src[i] = (float)(0.5 * sin(2 * kPi * 700.0 * (double)t / kSR));
+            o.clear();
+            block(d, src.data(), FRAMELENGTH, k == 0 ? 0 : -1, o);
+            if (k > 20) for (int i = 0; i < FRAMELENGTH; ++i) { const double r = o[i] - src[i]; e += r * r; x2 += (double)src[i] * src[i]; }
+        }
+        const double db = 10 * log10(e / x2 + 1e-30);
+        const bool ok = db < -120.0;
+        printf("dub: audition at %5.2fx%s -> loop output while dubbing onto silence %7.1f dB re the input (< -120)  %s\n",
+               (double)sp, glide ? " after a glide" : "              ", db, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 5. no denormals: SOS 0.5 over digital silence for 200 passes of a
+    //       short loop (the device ran ~5 min before "it did the same") ──
+    {
+        Noether d(2);
+        base(d, 1.0f, 0.5f, 1.0f, 1.0f);
+        Buffer b(2, kSR);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        recordSine(d, 220.0, 4800, 3, out, 0.5);                     // 0.1 s loop
+        const int L = d.getLoopSamples();
+        std::vector<float> z(FRAMELENGTH, 0.0f);
+        block(d, z.data(), FRAMELENGTH, 0, out);                      // overdub silence, for good
+        for (int k = 0; k < 200 * L / FRAMELENGTH; ++k) { out.clear(); block(d, z.data(), FRAMELENGTH, -1, out); }
+        int den = 0;
+        for (int i = 0; i < 2 * L; ++i) {
+            const float v = b.data[i];
+            if (v != 0.0f && v < 1.17549435e-38f && v > -1.17549435e-38f) ++den;
+        }
+        const bool ok = den == 0 && d.getState() == 3;
+        printf("dub: 200 passes of SOS 0.5 over silence -> %d denormal frames (state %d)  %s\n", den, d.getState(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    return fails ? 1 : 0;
+}
+
 static int t_nan()
 {
     const float poisons[] = { NAN, INFINITY, -INFINITY };
@@ -1294,6 +1464,7 @@ int main(int argc, char **argv)
     else if (!strcmp(m, "pulse"))  r = t_pulse();
     else if (!strcmp(m, "tri"))    r = t_tri();
     else if (!strcmp(m, "bars"))   r = t_bars();
+    else if (!strcmp(m, "dub"))    r = t_dub();
     else if (!strcmp(m, "extend")) r = t_extend();
     else if (!strcmp(m, "voct"))   r = t_voct();
     else if (!strcmp(m, "persist")) r = t_persist();
