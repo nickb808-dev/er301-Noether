@@ -115,6 +115,8 @@ anti-alias filter if 2x sounds harsh.
 
 ### Research: loop a section of the loop
 
+When work on a Size control starts, it begins the 0.9.x series.
+
 Play only part of the main loop, such as a quarter or one bar of four, and
 loop that part. This is zooming in, not slicing: one head, one region, and
 the whole loop stays intact underneath.
