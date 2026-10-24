@@ -113,6 +113,33 @@ See `LOOPER-PLAN.md` in the `dirac` repo. Next: the end-of-loop trigger
 output (its own flash), the shared-buffer workflow with Dirac, and a steeper
 anti-alias filter if 2x sounds harsh.
 
+### Research: loop a section of the loop
+
+Play only part of the main loop, such as a quarter or one bar of four, and
+loop that part. This is zooming in, not slicing: one head, one region, and
+the whole loop stays intact underneath.
+
+- **Why it came up:** at 0.5x in sync mode, the downbeat re-sync already
+  plays only the first half of the loop, over and over. It sounds like a
+  feature waiting to be chosen on purpose.
+- **What went wrong before:** 0.6.x had a Start / Len window. It was
+  removed in 0.7.0 because every wrap at a window edge was a crossfaded
+  jump, which clicked or softened attacks. It also pulled Noether toward
+  sequenced slices, which belong to Dirac. A section needs edges as clean
+  as the main seam. One idea: phase-match each section's end to its start
+  (the findSeam search) once, when the section is chosen, instead of
+  crossfading on every pass.
+- **Grammar to explore:** a Size control (1, 1/2, 1/4, 1/8 of the loop; in
+  sync mode, whole bars) and a Position control, latched at the section's
+  end. Morphagene's Gene Size / Slide is the nearest reference. Avoid a
+  per-step sequencer input that turns it back into slicing.
+- **Open questions:**
+  - Does overdub write only inside the section (a punch region), or is the
+    section a playback-only zoom?
+  - In sync mode, does a section of B bars re-sync every B bars?
+  - What do the ring and the bar readout show? The old window arc is a
+    starting point.
+
 ## Build
 
 Same as Landau: `make docker-image`, `make swig-docker ER301_SDK=~/er-301`,
