@@ -37,7 +37,7 @@ TOOLCHAIN ?= docker
 
 PKG     := noether
 MODULE  := libnoether
-VERSION := 0.8.3
+VERSION := 0.8.14
 ARCH    := am335x
 
 SRCDIR  := src
@@ -76,8 +76,9 @@ CXXFLAGS_ARM := \
 	-mfloat-abi=hard \
 	-Dfar=
 
-# DSP code: optimise for speed + NEON vectorisation.
-CXXFLAGS_DSP := $(CXXFLAGS_COMMON) -O2 $(CXXFLAGS_ARM)
+# DSP code: optimise for speed + NEON vectorisation. -fstack-usage writes
+# each function's frame to obj/Noether.su for tools/check-stack.sh.
+CXXFLAGS_DSP := $(CXXFLAGS_COMMON) -O2 $(CXXFLAGS_ARM) -fstack-usage
 
 # SWIG wrapper: optimise for size (lots of generated boilerplate).
 # NOTE: NO -include compat_swig.h here — the #define fprintf macro conflicts
@@ -122,7 +123,7 @@ OBJ_COMPAT := $(OBJS_DIR)/compat.o
 # ── PHONY TARGETS ─────────────────────────────────────────────────────────────
 
 .PHONY: all swig build docker-image docker-build swig-docker pkg dist clean help \
-        hosttest check-api check-ports check-version prune-old-pkgs
+        hosttest check-api check-ports check-version check-stack prune-old-pkgs
 
 all: help
 
@@ -247,7 +248,7 @@ docker-build: docker-image | $(OUTDIR)
 PKGDIR  := build/$(ARCH)
 PKGFILE := $(PKGDIR)/$(PKG)-$(VERSION).pkg
 
-pkg: check-api check-ports check-version check-lua $(PKGFILE) prune-old-pkgs
+pkg: check-api check-ports check-version check-lua check-stack $(PKGFILE) prune-old-pkgs
 
 # KEEP THE HISTORY. LIST, DO NOT DELETE. (Nick, 0.2.27)
 #
@@ -285,6 +286,14 @@ check-api:
 # connect on the device.
 check-ports:
 	@sh tools/check-ports.sh src/Noether.h src/Noether.cpp assets/Noether.lua
+
+# The ER-301's audio thread has a 2 KB stack. 0.8.10 overflowed it with a
+# 1 KB local array in the seam search (crash diagnostics: "STACK BLOWN"; to
+# the ear, ALL audio distorted until a reboot). Every engine frame must stay
+# small; the compiler's -fstack-usage report is the measurement.
+STACK_LIMIT := 256
+check-stack: $(OUTLIB)
+	@sh tools/check-stack.sh $(STACK_LIMIT) $(OBJS_DIR)/Noether.su
 
 # A Lua file-local used ABOVE its declaration is a nil GLOBAL — no syntax
 # error, no load error, no warning, just "attempt to call a nil value" at
@@ -340,7 +349,7 @@ hosttest: check-api check-ports check-version check-lua
 	g++ -std=c++11 -O2 -ffast-math -Itest/host -Isrc src/Noether.cpp test/host/main.cpp -o test/t
 	./test/t ident && ./test/t length && ./test/t seam && ./test/t pulse && ./test/t tri && ./test/t speed \
 	  && ./test/t sos && ./test/t extend && ./test/t voct && ./test/t persist \
-	  && ./test/t detent && ./test/t aa && ./test/t viz && ./test/t undo && ./test/t stop && ./test/t clock && ./test/t bars && ./test/t dub \
+	  && ./test/t detent && ./test/t aa && ./test/t viz && ./test/t undo && ./test/t stop && ./test/t clock && ./test/t bars && ./test/t dub && ./test/t close && ./test/t seamq && ./test/t clean && ./test/t syncdub && ./test/t stoprec && ./test/t barview \
 	  && ./test/t nan && ./test/t cpu
 	g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Itest/host -Isrc \
 	  src/Noether.cpp test/host/main.cpp -o test/t_asan

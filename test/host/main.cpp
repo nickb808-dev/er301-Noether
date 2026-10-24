@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <ctime>
 
 using noether::Noether;
@@ -40,7 +41,7 @@ static void setInputs(Noether &d, const Ctl *c, int n)
     od::Inlet *ins[] = { &d.mLeftIn, &d.mRightIn, &d.mRecIn, &d.mSpeedIn,
                          &d.mSosIn, &d.mDryIn, &d.mLevelIn,
                          &d.mVoctIn, &d.mExtIn, &d.mBarsIn,
-                         &d.mStopIn, &d.mUndoIn, &d.mClkIn };
+                         &d.mStopIn, &d.mUndoIn, &d.mClkIn, &d.mDubIn };
     for (int i = 0; i < n; ++i) {
         bool matched = false;
         for (auto *p : ins)
@@ -56,8 +57,8 @@ static void base(Noether &d, float speed = 1.0f, float sos = 0.5f, float dry = 1
 {
     Ctl c[] = {{"Speed", speed}, {"SOS", sos}, {"Dry", dry}, {"Level", level}, {"Rec", 0.0f},
                {"V/Oct", 0.0f}, {"Extend", 0.0f}, {"Bars", 0.0f},
-               {"Stop", 0.0f}, {"Undo", 0.0f}, {"Clk", 0.0f}};
-    setInputs(d, c, 11);
+               {"Stop", 0.0f}, {"Undo", 0.0f}, {"Clk", 0.0f}, {"Dub", 0.0f}};
+    setInputs(d, c, 12);
 }
 
 // Feed `src` (mono, may be shorter than the block) through one block; a REC
@@ -215,11 +216,15 @@ static int t_length()
         // and with matching OFF the cut is exactly where REC was pressed
         d.setSeamMatch(0);
         d.clearLoop();
-        silentBlocks(d, 1, out);
         d.zeroBuffer();                      // the menu task: clear, then silence the buffer
-        { double peak = 0; for (int i = 0; i < 10007; ++i) if (fabs(b.s.mpData[i]) > peak) peak = fabs(b.s.mpData[i]);
-          printf("length: clear + zeroBuffer -> state %d, buffer peak %.3f\n", d.getState(), peak);
-          if (!(d.getState() == 0 && peak == 0.0)) ++fails; }
+        // 0.8.5: the Lua-thread call only REQUESTS the zeroing (no 5.7 MB
+        // memset beside the audio); the loop fades out, then the audio
+        // thread zeroes kZeroPerBlock frames a block
+        double peak0 = 0; for (int i = 0; i < 10007; ++i) if (fabs(b.s.mpData[i]) > peak0) peak0 = fabs(b.s.mpData[i]);
+        silentBlocks(d, 2 * kSR / Noether::kZeroPerBlock + 4, out);
+        { double peak = 0; for (int i = 0; i < 2 * kSR; ++i) if (fabs(b.s.mpData[i]) > peak) peak = fabs(b.s.mpData[i]);
+          printf("length: clear + zeroBuffer -> untouched by the call (peak %.3f), then state %d, buffer peak %.3f\n", peak0, d.getState(), peak);
+          if (!(peak0 > 0.0 && d.getState() == 0 && peak == 0.0)) ++fails; }
         silentBlocks(d, 1, out);
         recordPulse(d, frames, 37, out);
         int L2 = d.getLoopSamples();
@@ -330,7 +335,10 @@ static int t_tri()
         out.clear();
         silentBlocks(d, 3 * kSR / FRAMELENGTH, out);
         const double slope = 0.8 * 4.0 * f / kSR;
-        const double step = maxAbsDiff(out, 0, out.size());
+        // from after the close's handover: the loop fades in there on
+        // purpose (0.8.4: 5 ms; 0.8.5: kHandover, 21 ms); the wraps this
+        // test guards come a second later
+        const double step = maxAbsDiff(out, Noether::kHandover + 64, out.size());
         const int back = frames - d.getLoopSamples();
         const int maxBack = (int)(kSR / f) + Noether::kMatchWin + 8;
         const bool ok = step <= slope * 1.05 && back <= maxBack && back >= 0;
@@ -552,7 +560,40 @@ static int t_persist()
     printf("persist: exported %d, imported %d (loop %d), %d buffer samples differ, %d output samples differ, state %d, mono-500 import -> %d, zero-loadcount-700 -> %d, tiny -> %d, null -> %d  %s\n",
            n, m, L, diff, pdiff, c.getState(), k, kz, kt, kn, ok ? "ok" : "FAIL");
     a.setSample(nullptr); c.setSample(nullptr);
-    return ok ? 0 : 1;
+    // ── 0.8.7: the loop buffer itself coming back from a SAVED file (the
+    //    player saved it at the quicksave prompt): while it is still loading
+    //    an import is refused (-5) and nothing changes; once it is in, the
+    //    import works; and playBuffer plays what the buffer already holds.
+    int f = 0;
+    {
+        Noether d(2);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        Buffer saved(2, kSR);
+        for (int i = 0; i < kSR; ++i) { const float v = (float)(0.6 * sin(2 * kPi * 220.0 * i / kSR)); saved.data[(size_t)i * 2] = v; saved.data[(size_t)i * 2 + 1] = -v; }
+        saved.s.mSampleLoadCount = kSR / 3;                // the pool is still filling it
+        d.setSample(&saved.s);
+        const int busy = d.importLoop(&ex.s), busy2 = d.playBuffer(L);
+        silentBlocks(d, 4, out);
+        const int stBusy = d.getState();
+        saved.s.mSampleLoadCount = kSR;                    // the load completes
+        const int pb = d.playBuffer(L);
+        std::vector<float> o1; silentBlocks(d, 40, o1);
+        const int stPlay = d.getState();
+        // what it plays is the buffer's own start, as an import of the same
+        // frames would: compare with a twin unit that imported them
+        Noether e(2); base(e, 1.0f, 0.5f, 0.0f, 1.0f);
+        Buffer be(2, kSR); e.setSample(&be.s);
+        Buffer src(2, L); for (int i = 0; i < L * 2; ++i) src.data[(size_t)i] = saved.data[(size_t)i];
+        e.importLoop(&src.s);
+        std::vector<float> o2; silentBlocks(e, 40, o2);
+        int same = 0; for (size_t i = 0; i < o1.size(); ++i) if (o1[i] != o2[i]) ++same;
+        const bool ok2 = busy == -5 && busy2 == -5 && stBusy == 0 && pb == L && stPlay == 2 && d.getLoopSamples() == L && same == 0;
+        printf("persist: buffer still loading -> import %d, playBuffer %d (both -5), state %d; loaded -> playBuffer %d (loop %d), state %d, output vs an import of the same frames: %d differ  %s\n",
+               busy, busy2, stBusy, pb, d.getLoopSamples(), stPlay, same, ok2 ? "ok" : "FAIL");
+        if (!ok2) ++f;
+        d.setSample(nullptr); e.setSample(nullptr);
+    }
+    return (ok && f == 0) ? 0 : 1;
 }
 
 // Detents: within 3 % of a ratio the target is exactly that ratio; outside
@@ -598,6 +639,7 @@ static int t_aa()
         d.setSample(&b.s);
         std::vector<float> out;
         recordSine(d, 300.0, 4800, 0, out);
+        silentBlocks(d, Noether::kHandover / FRAMELENGTH + 2, out);   // past the close's handover (0.8.5: 21 ms)
         const int L = d.getLoopSamples();
         int pos0 = d.vizPos() + 1;          // the next sample the head will read
         out.clear();
@@ -1147,15 +1189,71 @@ static int t_bars()
         rig.run(5 * P / FRAMELENGTH + 4, 0.3f);        // closes at 4P, clamped
         int st = d.getState(), L = d.getLoopSamples();
         rig.run(4, 0.3f);
-        rig.run(1, 0.7f, rig.t + 10);                  // overdub in
-        rig.run(20, 0.7f);
-        rig.run(1, 0.7f, rig.t + 10);                  // overdub out
-        rig.run(10, 0.7f);
-        bool ok = st == 2 && L == 4 * P + 50 - Noether::kSeam - 1 && d.canUndo() == 1;
+        rig.run(1, 0.7f, rig.t + 10);                  // overdub: armed (sync mode, 0.8.10)
+        rig.run(P / FRAMELENGTH + 2, 0.7f);            // in on the next bar line
+        rig.run(1, 0.7f, rig.t + 10);                  // out: armed
+        rig.run(P / FRAMELENGTH + 10, 0.7f);           // out on the next bar line
+        bool ok = st == 2 && L == 4 * P && d.canUndo() == 1;   // 0.8.6: the pre-roll seam needs no tail room — exactly 4 periods
         printf("bars: clocked close at the buffer's end -> state %d loop %d, overdub then canUndo %d  %s\n",
                st, L, d.canUndo(), ok ? "ok" : "FAIL");
         if (!ok) ++fails;
         d.setUndoSample(nullptr);
+        d.setSample(nullptr);
+    }
+    // ── 0.8.9: pulses per bar. 4 pulses a bar, Bars 2 -> the take is 8
+    //    pulses; the readouts count bars (and the beat within one); a
+    //    clocked loop's reel ticks are its bars. A manual clocked take that
+    //    is not whole bars shows pulses.
+    {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        d.setPulsesPerBar(4);
+        setBars(d, 2.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        const int Q = 3000;                               // a 16 Hz pulse: 4 a bar
+        ClockRig rig(d, out, Q);
+        rig.run(20, 0.3f);
+        rig.run(1, 0.3f, rig.t + 50);                     // arm
+        rig.run(Q / FRAMELENGTH + 2, 0.3f);               // starts on the next pulse
+        int bar1 = d.getBar(), beat1 = d.getBeat(), bars1 = d.getBars();
+        rig.run(5 * Q / FRAMELENGTH, 0.3f);               // 5 more pulses: bar 2, beat 2
+        int bar2 = d.getBar(), beat2 = d.getBeat(), st2 = d.getState();
+        rig.run(3 * Q / FRAMELENGTH + 2, 0.3f);           // the 8th pulse closes it
+        int st = d.getState(), L = d.getLoopSamples(), N = d.getSyncN();
+        rig.run(Q / FRAMELENGTH, 0.3f);
+        int barsP = d.getBars(), secs = d.getSections();
+        bool ok = bar1 == 1 && beat1 == 1 && bars1 == 2 && bar2 == 2 && beat2 == 2 && st2 == 1 &&
+                  st == 2 && L == 8 * Q && N == 8 && barsP == 2 && secs == 2;
+        printf("bars: 4 pulses a bar, bars 2 -> bar %d.%d of %d, then %d.%d (state %d), closed itself: loop %d (expect %d = 8 pulses), N %d, playing shows %d bars, reel %d sections  %s\n",
+               bar1, beat1, bars1, bar2, beat2, st2, L, 8 * Q, N, barsP, secs, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    {   // a manual clocked take of 3 pulses at 4 a bar: not whole bars -> pulses
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        d.setPulsesPerBar(4);
+        setBars(d, 0.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        const int Q = 3000;
+        ClockRig rig(d, out, Q);
+        rig.run(20, 0.3f);
+        rig.run(1, 0.3f, rig.t + 50);
+        rig.run(Q / FRAMELENGTH + 2, 0.3f);               // starts
+        rig.run(2 * Q / FRAMELENGTH, 0.3f);
+        rig.run(1, 0.3f, rig.t + 30);                     // REC: close on the next pulse
+        rig.run(Q / FRAMELENGTH + 2, 0.3f);
+        int L = d.getLoopSamples(), barsP = d.getBars(), beat = d.getBeat();
+        bool ok = L == 3 * Q && barsP == 3 && beat == 0;
+        printf("bars: 4 a bar, manual take of 3 pulses -> loop %d (expect %d), shows %d (pulses: not whole bars), beat %d  %s\n",
+               L, 3 * Q, barsP, beat, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
         d.setSample(nullptr);
     }
     return fails ? 1 : 0;
@@ -1329,11 +1427,711 @@ static int t_dub()
     return fails ? 1 : 0;
 }
 
+// Closing a take (0.8.4). Device report: "during the initial recording, if
+// the input is not completely silent at the moment of turning the record
+// off, there's still a click". While recording only the input is heard; at
+// the close the loop started from its head at FULL level — a step of up to
+// the signal's amplitude. The loop now fades in over 5 ms. Judged as the
+// largest sample-to-sample step anywhere in the run against the signal's
+// own largest step (dry + loop can at most double it).
+static int t_close()
+{
+    int fails = 0;
+    for (double f : {123.0, 1234.0}) for (float dry : {1.0f, 0.0f}) for (int clocked = 0; clocked < 2; ++clocked) {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, dry, 1.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out, src(FRAMELENGTH);
+        long t = 0;
+        auto x = [&](long n) { return (float)(0.8 * sin(2 * kPi * f * (double)n / kSR)); };
+        float *clk = d.mClkIn.buffer();
+        const int P = 12000;
+        if (clocked) d.mSyncOpt.set(2);
+        for (int k = 0; k < 600; ++k) {
+            for (int i = 0; i < FRAMELENGTH; ++i) {
+                src[i] = x(t + i);
+                clk[i] = (clocked && ((t + i) % P) < 4) ? 1.0f : 0.0f;
+            }
+            int edge = -1;
+            if (!clocked) { if (k == 1) edge = 5; if (k == 375) edge = 77; }
+            else if (k == 30 || k == 300) edge = 5;
+            block(d, src.data(), FRAMELENGTH, edge, out); t += FRAMELENGTH;
+        }
+        for (int i = 0; i < FRAMELENGTH; ++i) clk[i] = 0.0f;
+        const double own = 2 * kPi * f * 0.8 / kSR * (dry > 0.5f ? 2.0 : 1.0);
+        double worst = 0;
+        for (size_t i = 1000; i < out.size(); ++i) { const double st = fabs(out[i] - out[i - 1]); if (st > worst) worst = st; }
+        const bool ok = d.getState() == 2 && d.getLoopSamples() > 0 && worst / own <= 1.5;
+        printf("close: %6.0f Hz dry %.0f %s -> state %d, worst step %.2fx the signal's own (<= 1.5)  %s\n",
+               f, (double)dry, clocked ? "clocked" : "manual ", d.getState(), worst / own, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ending an EXTEND: the loop was already playing, so no fade — but the
+    // head moves from one cycle back to the new seam; judge that step too
+    for (double f : {123.0, 1234.0}) {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 1.0f, 1.0f);
+        Buffer b(1, kSR * 6);
+        d.setSample(&b.s);
+        std::vector<float> out, src(FRAMELENGTH);
+        long t = 0;
+        auto x = [&](long n) { return (float)(0.8 * sin(2 * kPi * f * (double)n / kSR)); };
+        auto run = [&](int blocks, int edge) {
+            for (int k = 0; k < blocks; ++k) {
+                for (int i = 0; i < FRAMELENGTH; ++i) src[i] = x(t + i);
+                block(d, src.data(), FRAMELENGTH, k == 0 ? edge : -1, out); t += FRAMELENGTH;
+            }
+        };
+        run(2, 5); run(300, -1); run(1, 40);                    // a ~0.8 s take
+        run(20, -1);
+        Ctl e[] = {{"Extend", 1.0f}}; setInputs(d, e, 1);
+        run(1, 10); run(450, -1);                               // overdub, runs off the end: EXTEND
+        const int stX = d.getState();
+        const size_t from = out.size();
+        run(1, 60); run(100, -1);                               // close the extend
+        // A click is a step out of line with its neighbours: the output's
+        // CURVATURE (second difference) at the worst point against the
+        // largest curvature a smooth sum of these sines can have. (Level is
+        // the wrong test here: the jump overlaps two correlated positions
+        // for 8 ms by design, so the slope can briefly exceed 3 layers'.)
+        // Only the close: from the REC edge through the 8 ms crossfade and a
+        // margin. (Later in the run, the overdub's punch-in point comes round
+        // — the end of a LINEAR 5 ms record ramp is a slope corner, about
+        // 2x this bound at 123 Hz and inaudible; not what this test is for.)
+        double worst = 0; size_t at = from;
+        const size_t until = from + 60 + Noether::kJumpOut + 256;
+        for (size_t i = from + 1; i + 1 < out.size() && i < until; ++i) {
+            const double c2 = fabs(out[i + 1] - 2.0 * out[i] + out[i - 1]);
+            if (c2 > worst) { worst = c2; at = i; }
+        }
+        const double w = 2 * kPi * f / kSR, own = 0.8 * w * w * 4.0;   // four layers at most
+        const bool ok = stX == 5 && d.getState() == 2 && worst / own <= 1.0;
+        printf("close: extend at %6.0f Hz -> was state %d, now %d, worst curvature %.2fx a smooth sum's (<= 1) at +%d  %s\n",
+               f, stX, d.getState(), worst / own, (int)(at - from), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 0.8.5: a CLOCKED loop of a tone that does not fit it (55 Hz: 13.75
+    //    cycles a period; 110 Hz: half a cycle off) wraps without a kink.
+    //    Tester: "click ... in the playback each time it loops" in sync
+    //    mode — the 2.7 ms blend between two phases the clock cannot align.
+    for (double f : {55.0, 110.0}) {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        d.mSyncOpt.set(2);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        const int P = 12000;
+        float *clk = d.mClkIn.buffer(), *rec = d.mRecIn.buffer(), *inL = d.mLeftIn.buffer();
+        long t = 0;
+        auto run = [&](int blocks, long recAt) {
+            for (int k = 0; k < blocks; ++k) {
+                for (int i = 0; i < FRAMELENGTH; ++i, ++t) {
+                    inL[i] = (float)(0.8 * sin(2 * kPi * f * (double)t / kSR));
+                    clk[i] = (t % P) < 4 ? 1.0f : 0.0f;
+                    rec[i] = (recAt >= 0 && t >= recAt && t < recAt + 4) ? 1.0f : 0.0f;
+                }
+                d.process();
+                for (int i = 0; i < FRAMELENGTH; ++i) out.push_back(d.mLeftOut.buffer()[i]);
+            }
+        };
+        run(20, -1); run(1, t + 50); run(100, -1);
+        run(1, t + 50); run(2 * P / FRAMELENGTH, -1);
+        const int Lp = d.getLoopSamples();
+        out.clear();
+        run(5 * Lp / FRAMELENGTH, -1);                     // five wraps, dry 0
+        const double w = 2 * kPi * f / kSR, own = 0.8 * w * w;
+        double worst = 0;
+        for (size_t i = 1; i + 1 < out.size(); ++i) { const double c2 = fabs(out[i + 1] - 2 * out[i] + out[i - 1]); if (c2 > worst) worst = c2; }
+        const bool ok = Lp == P && worst / own <= 2.0;
+        printf("close: clocked loop of %3.0f Hz (does not fit) -> loop %d, worst curvature over 5 wraps %.1fx the sine's (<= 2)  %s\n",
+               f, Lp, worst / own, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 0.8.5: CLEAR while the loop plays fades it out (was a hard stop) ──
+    for (double f : {123.0, 1234.0}) {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+        Buffer b(1, kSR * 2);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        recordSine(d, f, 30000, 3, out, 0.8);
+        silentBlocks(d, 40, out);
+        out.erase(out.begin(), out.end() - 1);   // keep the last sample BEFORE the clear: the step is between it and the next
+        d.clearLoop(); d.zeroBuffer();
+        silentBlocks(d, 2 * kSR / Noether::kZeroPerBlock + 4, out);
+        const double own = 2 * kPi * f * 0.8 / kSR;
+        const double worst = maxAbsDiff(out, 0, out.size());
+        double peak = 0; for (int i = 0; i < 2 * kSR; ++i) if (fabs(b.data[i]) > peak) peak = fabs(b.data[i]);
+        const bool ok = worst / own <= 1.5 && d.getState() == 0 && peak == 0.0;
+        printf("close: clear while playing %6.0f Hz -> worst step %.2fx the sine's own (<= 1.5), state %d, buffer peak %.3f  %s\n",
+               f, worst / own, d.getState(), peak, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    // ── 0.8.5: the HANDOVER at a close, judged by CURVATURE. Tester on
+    //    0.8.4: "a short pop only when you stop recording", free and
+    //    clocked. 0.8.4's 5 ms linear fade passed the step checks above
+    //    (small steps) but is a thump on low tones: shorter than their
+    //    period, cornered at both ends — 40x a smooth sum's curvature at
+    //    55 Hz. The step metric was the wrong instrument (standard §6).
+    for (double f : {55.0, 123.0}) for (float dry : {1.0f, 0.0f}) for (int clocked = 0; clocked < 2; ++clocked) {
+        Noether d(1);
+        base(d, 1.0f, 0.5f, dry, 1.0f);
+        Buffer b(1, kSR * 4);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        float *clk = d.mClkIn.buffer(), *rec = d.mRecIn.buffer(), *inL = d.mLeftIn.buffer();
+        const int P = 12000; long t = 0; long closeAt = -1;
+        if (clocked) d.mSyncOpt.set(2);
+        auto run = [&](int blocks, long recAt) {
+            for (int k = 0; k < blocks; ++k) {
+                for (int i = 0; i < FRAMELENGTH; ++i, ++t) {
+                    inL[i] = (float)(0.8 * sin(2 * kPi * f * (double)t / kSR));
+                    clk[i] = (clocked && (t % P) < 4) ? 1.0f : 0.0f;
+                    rec[i] = (recAt >= 0 && t >= recAt && t < recAt + 4) ? 1.0f : 0.0f;
+                }
+                const int st0 = d.getState();
+                d.process();
+                if (st0 == 1 && d.getState() == 2 && closeAt < 0) closeAt = (long)out.size();
+                for (int i = 0; i < FRAMELENGTH; ++i) out.push_back(d.mLeftOut.buffer()[i]);
+            }
+        };
+        if (clocked) { run(20, -1); run(1, t + 50); run(100, -1); run(1, t + 50); run(200, -1); }
+        else         { run(2, 5); run(300, -1); run(1, t + 77); run(200, -1); }
+        const double w = 2 * kPi * f / kSR, own = 0.8 * w * w * 2.0;   // dry + loop
+        double worst = 0;
+        for (long i = closeAt - 128; closeAt > 0 && i < closeAt + 2880 && i + 1 < (long)out.size(); ++i) {
+            const double c2 = fabs(out[i + 1] - 2 * out[i] + out[i - 1]); if (c2 > worst) worst = c2; }
+        const bool ok = closeAt > 0 && worst / own <= 1.5;
+        printf("close: handover %3.0f Hz dry %.0f %s -> closed %d, worst curvature %.1fx a smooth sum's (<= 1.5)  %s\n",
+               f, (double)dry, clocked ? "clocked" : "free   ", closeAt > 0, worst / own, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    return fails ? 1 : 0;
+}
+
+// Seam quality, by the metrics of lucasowens/previously DESIGN §5.6 (0.8.6):
+// play the loop ACROSS the wrap from the buffer (what playback at 1x reads)
+// and compare the seam to the loop's own body —
+//   click metric: high-passed (2nd difference) energy in the seam window /
+//                 the mean of same-length body windows; <= 1.1
+//   envelope:     5 ms RMS through the seam within the body's own 5 ms RMS
+//                 range +/- 1 dB
+// on their signals: a sine that does not fit the loop, 40 Hz bass, DC
+// offset, white noise, a kick on the downbeat, an anti-phase stereo pair —
+// for clocked closes (pre-roll seam) and free closes (phase-matched blend).
+// A clocked close must also leave the downbeat bit-exact.
+struct SeamQ { double click, envLo, envHi; int headChanged; bool closed; int L; };
+
+static SeamQ seamQuality(int which, bool clocked)
+{
+    const int nc = (which == 5) ? 2 : 1;
+    Noether d(nc);
+    base(d, 1.0f, 0.5f, 0.0f, 1.0f);
+    if (clocked) d.mSyncOpt.set(2);
+    Buffer b(nc, kSR * 4);
+    d.setSample(&b.s);
+    const int P = 12000;
+    uint32_t rng = 0x12345u;
+    auto sig = [&](long t, int ch) -> float {
+        const double tt = (double)t / kSR;
+        switch (which) {
+        case 0: return (float)(0.8 * sin(2 * kPi * 54.5 * tt));                       // does not fit: 1/4 cycle off a 2-period loop
+        case 1: return (float)(0.8 * sin(2 * kPi * 40.0 * tt));                       // 40 Hz bass
+        case 2: return (float)(0.4 + 0.3 * sin(2 * kPi * 97.0 * tt));                 // DC offset
+        case 3: { rng = rng * 1664525u + 1013904223u; return ((float)(rng >> 8) / 8388608.0f - 1.0f) * 0.5f; }  // noise
+        case 4: { const long ph = t % P;                                              // a kick on every clock edge, alone
+                  return (float)(ph < 9600 ? 0.8 * exp(-(double)ph / 2400.0) * sin(2 * kPi * 60.0 * ph / kSR) : 0.0); }
+        case 6: return (float)(0.8 * sin(2 * kPi * 55.0 * tt));                       // EXACTLY half a cycle off (report only)
+        default: { const float v = (float)(0.7 * sin(2 * kPi * 54.5 * tt)); return ch ? -v : v; }   // anti-phase pair
+        }
+    };
+    float *clk = d.mClkIn.buffer(), *rec = d.mRecIn.buffer(), *inL = d.mLeftIn.buffer(), *inR = d.mRightIn.buffer();
+    long t = 0, startT = -1;
+    std::vector<float> histL, histR;                                   // the input, to check the downbeat
+    auto run = [&](int blocks, long recAt) {
+        for (int k = 0; k < blocks; ++k) {
+            for (int i = 0; i < FRAMELENGTH; ++i, ++t) {
+                inL[i] = sig(t, 0); inR[i] = nc > 1 ? sig(t, 1) : inL[i];
+                histL.push_back(inL[i]); histR.push_back(inR[i]);
+                clk[i] = (clocked && (t % P) < 4) ? 1.0f : 0.0f;
+                rec[i] = (recAt >= 0 && t >= recAt && t < recAt + 4) ? 1.0f : 0.0f;
+            }
+            const int st0 = d.getState();
+            d.process();
+            if (st0 != 1 && d.getState() == 1 && startT < 0) {
+                // the take began in this block: find its first frame in the history
+                for (long c = t - FRAMELENGTH; c < t; ++c)
+                    if (b.data[0] == histL[c] && (nc < 2 || b.data[1] == histR[c]) && b.data[(size_t)nc] == (c + 1 < t ? histL[c + 1] : b.data[(size_t)nc])) { startT = c; break; }
+            }
+        }
+    };
+    if (clocked) { run(20, -1); run(1, t + 50); run(200, -1); run(1, t + 50); run(2 * P / FRAMELENGTH, -1); }   // a 2-period take
+    else         { run(20, -1); run(1, t + 40); run(320, -1); run(1, t + 77); run(40, -1); }
+    SeamQ q = { 0, 0, 0, -1, d.getState() == 2, d.getLoopSamples() };
+    // W spans several periods of the lowest test tone (100 ms, 4 of 40 Hz):
+    // a 1536-frame window was 1.28 periods and its energy followed the
+    // phase it started at (free 40 Hz read 1.12 with an exact seam)
+    const int L = q.L, W = 4800, N = 4096;
+    if (!q.closed || L < 3 * N) { d.setSample(nullptr); return q; }
+    // the played sequence: buf[L-N .. L) then buf[0 .. N), channel by channel
+    auto played = [&](int c, int i) -> float { const int pos = i < N ? L - N + i : i - N; return b.data[(size_t)pos * nc + c]; };
+    auto hpE = [&](int c, int from, int len, bool acrossWrap) {
+        double e = 0;
+        for (int i = from + 1; i < from + len - 1; ++i) {
+            float a, m, z;
+            if (acrossWrap) { a = played(c, i - 1); m = played(c, i); z = played(c, i + 1); }
+            else { a = b.data[(size_t)(i - 1) * nc + c]; m = b.data[(size_t)i * nc + c]; z = b.data[(size_t)(i + 1) * nc + c]; }
+            const double h = z - 2.0 * m + a; e += h * h;
+        }
+        return e;
+    };
+    auto rms = [&](int c, int from, int len, bool acrossWrap) {
+        double e = 0;
+        for (int i = from; i < from + len; ++i) { const float v = acrossWrap ? played(c, i) : b.data[(size_t)i * nc + c]; e += (double)v * v; }
+        return sqrt(e / len);
+    };
+    double clickWorst = 0, lo = 0, hi = 0;
+    for (int c = 0; c < nc; ++c) {
+        // seam window: the pre-roll crossfade before the wrap, +/- margins.
+        // Reference: a clocked 2-period loop is compared with the SAME
+        // place half a loop away (also a clock edge: a kick's attack there
+        // is content, not a click); a free loop with the body's mean.
+        const int seamFrom = N - Noether::kSeamClocked / 2 - W / 2;   // centred on the crossfade
+        const double eSeam = hpE(c, seamFrom, W, true);
+        double eBody = 0; int nb = 0;
+        if (clocked) { eBody = hpE(c, L / 2 - (N - seamFrom), W, false); nb = 1; }
+        else for (int at = L / 4; at + W < 3 * L / 4; at += W) { eBody += hpE(c, at, W, false); ++nb; }
+        eBody /= nb;
+        const double click = eBody > 1e-20 ? eSeam / eBody : (eSeam > 1e-20 ? 1e9 : 1.0);
+        if (click > clickWorst) clickWorst = click;
+        // envelope: 25 ms RMS (longer than a 40 Hz period — a 5 ms window
+        // measures a low tone's phase, not its level) through the seam vs the
+        // body's own 25 ms RMS range
+        const int R = 1200;
+        double bMin = 1e9, bMax = 0;
+        for (int at = L / 4; at + R < 3 * L / 4; at += 120) { const double r = rms(c, at, R, false); if (r < bMin) bMin = r; if (r > bMax) bMax = r; }
+        for (int at = seamFrom - R / 2; at + R < seamFrom + W + R / 2 && at + R < 2 * N; at += 120) {
+            const double r = rms(c, at, R, true);
+            const double dLo = 20 * log10((r + 1e-12) / (bMin + 1e-12)), dHi = 20 * log10((r + 1e-12) / (bMax + 1e-12));
+            if (dLo < lo) lo = dLo;
+            if (dHi > hi) hi = dHi;
+        }
+    }
+    q.click = clickWorst; q.envLo = lo; q.envHi = hi;
+    if (startT >= 0) {                                   // 0.8.6: free closes too keep the downbeat
+        q.headChanged = 0;
+        for (int k = 0; k < 2048; ++k) for (int c = 0; c < nc; ++c)
+            if (b.data[(size_t)k * nc + c] != (c ? histR[startT + k] : histL[startT + k])) ++q.headChanged;
+    }
+    d.setSample(nullptr);
+    return q;
+}
+
+static int t_seamq()
+{
+    int fails = 0;
+    const char *names[7] = { "54.5 Hz, 1/4 cycle off", "40 Hz bass", "DC offset", "white noise", "kick on the downbeat", "anti-phase stereo", "55 Hz, 1/2 cycle off" };
+    for (int clocked = 1; clocked >= 0; --clocked) for (int w = 0; w < 6; ++w) {
+        const SeamQ q = seamQuality(w, clocked != 0);
+        const bool envOk = q.envLo >= -1.0 && q.envHi <= 1.0;
+        const bool headOk = q.headChanged == 0;
+        const bool ok = q.closed && q.click <= 1.1 && envOk && headOk;
+        printf("seamq: %s %-22s -> loop %6d, click %.2f (<= 1.1), envelope %+.2f / %+.2f dB (within 1), downbeat frames changed %d  %s\n",
+               clocked ? "clocked" : "free   ", names[w], q.L, q.click, q.envLo, q.envHi, q.headChanged, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+    }
+    // the known limit, reported not judged: a steady tone EXACTLY half a
+    // cycle off a clocked loop meets its own inverse — any crossfade between
+    // a signal and its inverse passes through silence. Track the number.
+    {
+        const SeamQ q = seamQuality(6, true);
+        printf("seamq: clocked %-22s -> envelope dip %+.1f dB (known limit: a crossfade between a tone and its inverse), downbeat frames changed %d\n",
+               names[6], q.envLo, q.headChanged);
+    }
+    return fails ? 1 : 0;
+}
+
+// Keep clean (0.8.8): Noether saves its loop itself, so its own buffer must
+// not be marked "unsaved" — any dirty pool sample makes every quicksave ask
+// to save buffers (Persist/init.lua handleUnsavedBuffers). A buffer the
+// player attached (setKeepClean(0)) keeps the SDK's behaviour.
+static int t_clean()
+{
+    int fails = 0;
+    for (int keep = 1; keep >= 0; --keep) {
+        Noether d(2);
+        base(d, 1.0f, 0.5f, 1.0f, 1.0f);
+        Buffer b(2, kSR * 2);
+        const bool bornDirty = b.s.mDirty;              // setMemoryOnly marks a new buffer dirty
+        b.s.setClean();                                 // what Noether.lua does on attach
+        d.setKeepClean(keep);
+        d.setSample(&b.s);
+        std::vector<float> out;
+        recordSine(d, 220.0, 20000, 3, out);            // a take, closed
+        const bool afterTake = b.s.mDirty;
+        std::vector<float> dc(FRAMELENGTH, 0.3f);
+        block(d, dc.data(), FRAMELENGTH, 0, out);       // overdub in
+        for (int k = 0; k < 40; ++k) block(d, dc.data(), FRAMELENGTH, -1, out);
+        block(d, dc.data(), FRAMELENGTH, 0, out);       // out
+        silentBlocks(d, 4, out);
+        const bool afterDub = b.s.mDirty;
+        d.clearLoop(); d.zeroBuffer();
+        silentBlocks(d, 2 * kSR / Noether::kZeroPerBlock + 12, out);
+        const bool afterClear = b.s.mDirty;
+        const bool ok = bornDirty && (keep ? (!afterTake && !afterDub && !afterClear) : (afterTake && afterDub));
+        printf("clean: keep %d -> new buffer dirty %d; after a take %d, an overdub %d, a clear %d (keep 1: all 0; keep 0: marked)  %s\n",
+               keep, bornDirty, afterTake, afterDub, afterClear, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        d.setSample(nullptr);
+    }
+    return fails ? 1 : 0;
+}
+
+// Sync-mode overdub and extend (0.8.10). Nick: "I want overdub to do
+// another looped take at that bar count when in sync mode. Extend should
+// update the bar count so re-sync and readouts follow new length."
+// Rig: 4 pulses a bar, a pulse every Q; a 2-bar loop (8 pulses).
+struct SyncRig {
+    Noether d;
+    Buffer b;
+    std::vector<float> out;
+    long t = 0;
+    const int Q = 3000;
+    std::vector<int> stateAt;                // per block
+    std::vector<long> edges;                 // clock edge times
+    SyncRig(bool sync) : d(1), b(1, kSR * 6)
+    {
+        base(d, 1.0f, 0.0f, 0.0f, 1.0f);
+        if (sync) d.mSyncOpt.set(2);
+        d.setPulsesPerBar(4);
+        d.setSample(&b.s);
+    }
+    void bars(float n) { Ctl c[] = {{"Bars", n}}; setInputs(d, c, 1); }
+    void ext(float g)  { Ctl c[] = {{"Extend", g}}; setInputs(d, c, 1); }
+    // run whole blocks; REC pulse at absolute sample recAt (if >= 0)
+    void run(int blocks, float in, long recAt = -1, long dubAt = -1)
+    {
+        float *L = d.mLeftIn.buffer(), *R = d.mRightIn.buffer(), *rec = d.mRecIn.buffer(), *clk = d.mClkIn.buffer(), *dub = d.mDubIn.buffer();
+        for (int k = 0; k < blocks; ++k) {
+            for (int i = 0; i < FRAMELENGTH; ++i) {
+                const long tt = t + i;
+                L[i] = R[i] = in;
+                clk[i] = (tt % Q) < 4 ? 1.0f : 0.0f;
+                if ((tt % Q) == 0) edges.push_back(tt);
+                rec[i] = (recAt >= 0 && tt >= recAt && tt < recAt + 4) ? 1.0f : 0.0f;
+                dub[i] = (dubAt >= 0 && tt >= dubAt && tt < dubAt + 4) ? 1.0f : 0.0f;
+            }
+            d.process();
+            for (int i = 0; i < FRAMELENGTH; ++i) out.push_back(d.mLeftOut.buffer()[i]);
+            stateAt.push_back(d.getState());
+            t += FRAMELENGTH;
+        }
+    }
+    void blocksTo(long until, float in) { while (t < until) run(1, in); }
+    // a REC press at sample `at`: run up to the block that CONTAINS it, then
+    // that block with the press (the first draft stopped 200 samples short
+    // and ran one block — which often ended before the press: no press)
+    void pressAt(long at, float in)
+    {
+        while (t + FRAMELENGTH <= at) run(1, in);
+        run(1, in, at);
+    }
+    void dubAt(long at, float in)                     // the DUB button (0.8.10)
+    {
+        while (t + FRAMELENGTH <= at) run(1, in);
+        run(1, in, -1, at);
+    }
+    // the first block index whose state is s, at or after block `from`
+    long firstBlock(int s, long from) const { for (size_t k = (size_t)from; k < stateAt.size(); ++k) if (stateAt[k] == s) return (long)k; return -1; }
+    // a 2-bar take (Bars 2 = 8 pulses): returns the close edge time
+    long take()
+    {
+        bars(2.0f);
+        run(20, 0.3f);
+        run(1, 0.3f, t + 50);                         // arm
+        blocksTo(t + 10 * Q, 0.3f);                   // starts, 8 pulses, closes
+        for (size_t k = 1; k < stateAt.size(); ++k) if (stateAt[k - 1] == 1 && stateAt[k] == 2) return (long)k * FRAMELENGTH;
+        return -1;
+    }
+};
+
+static int t_syncdub()
+{
+    int fails = 0;
+    {   // ── a counted overdub: armed mid-bar, in on the bar line, out by
+        //    itself after exactly 2 bars (8 pulses), on a bar line
+        SyncRig r(true);
+        const long tc = r.take();
+        const int L = r.d.getLoopSamples();
+        r.bars(2.0f);
+        const long press = r.t + r.Q + 700;           // mid-bar
+        const long pressBlock = press / FRAMELENGTH;
+        r.pressAt(press, 0.6f);
+        r.blocksTo(r.t + 14 * r.Q, 0.6f);
+        const int armedThen = 0;
+        const long in = r.firstBlock(3, pressBlock) * FRAMELENGTH;
+        const long outB = r.firstBlock(2, in / FRAMELENGTH) * FRAMELENGTH;
+        // bar lines: every 4 pulses from the loop's downbeat (the close edge)
+        const long inPulses = (in - tc + r.Q / 2) / r.Q, outPulses = (outB - tc + r.Q / 2) / r.Q;
+        const bool onBarIn = labs(in - (tc + inPulses * r.Q)) < 2 * FRAMELENGTH && inPulses % 4 == 0;
+        const bool notAtPress = in > press + r.Q / 2;
+        const long span = outB - in;                  // 8 pulses + the 5 ms ramp out
+        const bool spanOk = labs(span - 8 * r.Q) < 240 + 2 * FRAMELENGTH;
+        const bool ok = L == 8 * r.Q && onBarIn && notAtPress && spanOk && r.d.getDubArmed() == 0;
+        printf("syncdub: counted (Bars 2, 4 a bar) -> press mid-bar, in %ld samples later on pulse %ld from the downbeat (a bar line %d), lasted %ld (expect %d + ramp) %s\n",
+               in - press, inPulses, (int)onBarIn, span, 8 * r.Q, ok ? "ok" : "FAIL");
+        (void)armedThen; (void)outPulses;
+        if (!ok) ++fails;
+        r.d.setSample(nullptr);
+    }
+    {   // ── manual (Bars 0): in and out both on bar lines
+        SyncRig r(true);
+        const long tc = r.take();
+        r.bars(0.0f);
+        const long p1 = r.t + r.Q + 900;
+        r.pressAt(p1, 0.6f);
+        r.blocksTo(r.t + 6 * r.Q, 0.6f);
+        const long p2 = r.t + 1300;
+        r.pressAt(p2, 0.6f);
+        r.blocksTo(r.t + 6 * r.Q, 0.6f);
+        const long in = r.firstBlock(3, p1 / FRAMELENGTH) * FRAMELENGTH;
+        const long outB = r.firstBlock(2, in / FRAMELENGTH) * FRAMELENGTH;
+        const long ip = (in - tc + r.Q / 2) / r.Q, op = (outB - 240 - tc + r.Q / 2) / r.Q;
+        const bool ok = ip % 4 == 0 && op % 4 == 0 && outB > p2;
+        printf("syncdub: manual (Bars 0) -> in on pulse %ld, out on pulse %ld from the downbeat (both bar lines)  %s\n", ip, op, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        r.d.setSample(nullptr);
+    }
+    {   // ── pressing again while armed cancels: no overdub, the loop untouched
+        SyncRig r(true);
+        r.take();
+        std::vector<float> before(r.b.data.begin(), r.b.data.begin() + r.d.getLoopSamples());
+        const long p1 = r.t + r.Q + 500;
+        r.pressAt(p1, 0.9f);
+        r.pressAt(r.t + 200, 0.9f);                   // again, well before the bar line
+        r.blocksTo(r.t + 10 * r.Q, 0.9f);
+        int changed = 0; for (size_t i = 0; i < before.size(); ++i) if (r.b.data[i] != before[i]) ++changed;
+        const bool ok = r.firstBlock(3, 0) < 0 && changed == 0 && r.d.getDubArmed() == 0;
+        printf("syncdub: armed then pressed again -> overdub never started %d, %d loop samples changed  %s\n", r.firstBlock(3, 0) < 0, changed, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        r.d.setSample(nullptr);
+    }
+    {   // ── free mode: the overdub starts on the press, as before
+        SyncRig r(false);
+        recordSine(r.d, 220.0, 20000, 3, r.out);
+        const long press = r.t + 700;
+        r.pressAt(press, 0.5f);
+        const bool ok = r.stateAt.back() == 3;
+        printf("syncdub: free mode -> overdub in the block of the press %d  %s\n", (int)ok, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        r.d.setSample(nullptr);
+    }
+    {   // ── the DUB button (0.8.10), sync mode: in and out NOW, not on bars
+        SyncRig r(true);
+        r.take();
+        r.bars(0.0f);
+        const long d1 = r.t + r.Q + 900;               // mid-bar
+        r.dubAt(d1, 0.6f);
+        const int inNow = r.stateAt.back();             // the press's own block
+        const long d2 = r.t + 2 * r.Q + 400;            // mid-bar again
+        r.dubAt(d2, 0.6f);
+        r.run(3, 0.6f);                                 // the 5 ms ramp out
+        const int outSoon = r.stateAt.back();
+        // dub while a rec overdub is WAITING for the bar line: starts now
+        const long p = r.t + r.Q + 700;
+        r.pressAt(p, 0.6f);
+        const int armed = r.d.getDubArmed();
+        r.dubAt(r.t + 300, 0.6f);
+        const int nowIn = r.stateAt.back(), armedAfter = r.d.getDubArmed();
+        r.dubAt(r.t + 300, 0.6f); r.run(3, 0.6f);
+        // dub during a COUNTED (rec) overdub: stops now, not after its bars
+        r.bars(2.0f);
+        r.pressAt(r.t + r.Q + 500, 0.6f);
+        // wait for it to start on its bar line (bar lines come every 4
+        // pulses here; the first draft waited 2 pulses and saw nothing)
+        for (int k = 0; k < 6 * r.Q / FRAMELENGTH && r.stateAt.back() != 3; ++k) r.run(1, 0.6f);
+        r.run(8, 0.6f);
+        const int counting = r.stateAt.back(), dubBars = r.d.getDubBars();
+        r.dubAt(r.t + 300, 0.6f); r.run(3, 0.6f);
+        const int stopped = r.stateAt.back();
+        const bool ok = inNow == 3 && outSoon == 2 && armed == 1 && nowIn == 3 && armedAfter == 0 &&
+                        counting == 3 && dubBars == 2 && stopped == 2;
+        printf("syncdub: dub button -> in at the press %d, out within the ramp %d; while a rec dub waits: armed %d -> in now %d (armed %d); during a counted dub (%d bars): out now %d  %s\n",
+               inNow == 3, outSoon == 2, armed, nowIn == 3, armedAfter, dubBars, stopped == 2, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        r.d.setSample(nullptr);
+    }
+    {   // ── dub with no loop: nothing to overdub, nothing happens
+        SyncRig r(true);
+        r.run(20, 0.3f);
+        r.dubAt(r.t + 300, 0.6f);
+        r.run(4, 0.6f);
+        const bool ok = r.stateAt.back() == 0 && r.d.getLoopSamples() == 0;
+        printf("syncdub: dub with no loop -> state %d (stays empty)  %s\n", r.stateAt.back(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        r.d.setSample(nullptr);
+    }
+    {   // ── extend in sync, Bars 1: adds exactly one bar; N grows 8 -> 12; the
+        //    loop then stays on the downbeat (no re-sync yanking it back)
+        SyncRig r(true);
+        const long tc = r.take();
+        (void)tc;
+        r.bars(1.0f);
+        r.ext(1.0f);
+        const long press = r.t + 600;
+        r.pressAt(press, 0.5f);                       // armed; in at the next bar line, runs off the end, extends
+        r.blocksTo(r.t + 14 * r.Q, 0.5f);
+        r.ext(0.0f);
+        const int N = r.d.getSyncN(), L = r.d.getLoopSamples(), bars = r.d.getBars();
+        long close = -1; for (size_t k = 1; k < r.stateAt.size(); ++k) if (r.stateAt[k - 1] == 5 && r.stateAt[k] != 5) close = (long)k * FRAMELENGTH;   // stateAt[k] = after block k: it closed IN block k
+        // the close edge: the clock edge inside the block that left EXTEND
+        long ce = -1; for (long e : r.edges) if (close >= 0 && e >= close && e < close + FRAMELENGTH) ce = e;
+        // over the next 3 loops the head is at the loop's start on every
+        // downbeat (every 12 pulses); with the old pulse count (8) the
+        // re-sync would yank it back every 8 and it would be 4 pulses in
+        int worst = 0;
+        for (int k = 1; k <= 3 && ce >= 0; ++k) {
+            r.blocksTo(ce + (long)k * 12 * r.Q + 2 * FRAMELENGTH, 0.0f);
+            const int v = r.d.vizPos();
+            const int dist = v < L / 2 ? v : L - v;
+            if (dist > worst) worst = dist;
+        }
+        const bool ok = N == 12 && L == 12 * r.Q && bars == 3 && ce >= 0 && worst <= 3 * FRAMELENGTH;
+        printf("syncdub: extend in sync, Bars 1 -> loop %d (expect %d = 12 pulses), N %d (expect 12), shows %d bars; close edge found %d; on the next 3 downbeats the head is %d samples from the start (<= %d)  %s\n",
+               L, 12 * r.Q, N, bars, (int)(ce >= 0), worst, 3 * FRAMELENGTH, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+        r.d.setSample(nullptr);
+    }
+    return fails ? 1 : 0;
+}
+
+
+// Stop during a take (0.8.14). Nick: "interesting behavior when you try to
+// hit 'stop' when it is recording. it kind of holds" — until 0.8.13 the take
+// ignored stop and kept recording. Now: free, the take closes at the press;
+// sync, on the next pulse (a whole number of pulses); the loop lands held
+// (STOP) and plays when stop is released.
+// The bar readout (0.8.14). Nick: "check that sub-screen bar count is
+// accurate ... maybe the graphic is not representing reality". Until 0.8.14
+// it counted clock pulses: right at 1x, wrong at other speeds (0.5x showed
+// bar 2 while the downbeat re-sync kept the head in bar 1), running while
+// stopped, frozen through an extension, and a loop off the bar lines read
+// its pulses as "bar". Now it reads the play head; and a sync stop releases
+// in phase with the clock (it used to resume in place, out of time).
+static int t_barview()
+{
+    int fails = 0;
+    auto headBar = [](SyncRig &r) { const int L = r.d.getLoopSamples(), b = r.d.getBars();
+                                    return (L > 0 && b > 0) ? (int)((long)r.d.vizPos() * b / L) + 1 : 0; };
+    const float speeds[] = { 1.0f, 0.5f, 2.0f, -1.0f };
+    for (float sp : speeds) {
+        SyncRig r(true); r.take();
+        { Ctl c[] = {{"Speed", sp}}; setInputs(r.d, c, 1); }
+        r.run(40, 0.0f);                              // glide settles
+        int bad = 0, n = 0;
+        for (int k = 0; k < 400; ++k) { r.run(1, 0.0f); ++n; if (r.d.getBar() != headBar(r)) ++bad; }
+        const bool ok = bad == 0;
+        printf("barview: speed %+.1f -> readout != head bar in %d of %d blocks  %s\n", sp, bad, n, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+    }
+    {   // stop / release in sync: back where an unstopped twin is
+        SyncRig a(true), b(true); a.take(); b.take();
+        a.run(30, 0.0f); b.run(30, 0.0f);
+        { Ctl c[] = {{"Stop", 1.0f}}; setInputs(a.d, c, 1); }
+        a.run(100, 0.0f); b.run(100, 0.0f);           // across a downbeat
+        const int heldBar = a.d.getBar(), twinBar = b.d.getBar();
+        { Ctl c[] = {{"Stop", 0.0f}}; setInputs(a.d, c, 1); }
+        a.run(1, 0.0f); b.run(1, 0.0f);
+        const int L = a.d.getLoopSamples();
+        int dpos = a.d.vizPos() - b.d.vizPos(); if (dpos > L / 2) dpos -= L; if (dpos < -L / 2) dpos += L;
+        a.run(200, 0.0f); b.run(200, 0.0f);
+        int dlater = a.d.vizPos() - b.d.vizPos(); if (dlater > L / 2) dlater -= L; if (dlater < -L / 2) dlater += L;
+        const bool ok = heldBar == twinBar && abs(dpos) <= FRAMELENGTH && abs(dlater) <= FRAMELENGTH && a.d.getState() == 2;
+        printf("barview: sync stop -> held readout bar %d (twin %d); released head %+d samples from the twin, %+d later  %s\n",
+               heldBar, twinBar, dpos, dlater, ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+    }
+    {   // an extension counts up; a manual 7-pulse loop reads in beats
+        SyncRig r(true); r.take(); r.bars(1.0f); r.ext(1.0f); r.run(2, 0.3f); r.pressAt(r.t + 300, 0.3f);
+        int lo = 99, hi = 0, seen = 0;
+        for (int k = 0; k < 400; ++k) { r.run(1, 0.3f); if (r.d.getState() == 5) { ++seen; lo = std::min(lo, r.d.getBar()); hi = std::max(hi, r.d.getBar()); } }
+        SyncRig m(true); m.bars(0.0f); m.run(20, 0.3f); m.run(1, 0.3f, m.t + 50); m.blocksTo(m.t + 6 * m.Q + 500, 0.3f); m.run(1, 0.3f, m.t + 50); m.blocksTo(m.t + m.Q, 0.3f);
+        const bool ok = seen > 0 && lo == 3 && hi == 3 && r.d.getBars() == 3 && m.d.getSyncN() == 7 && m.d.getBarsWhole() == 0 && r.d.getBarsWhole() == 1;
+        printf("barview: extending 2 -> 3 bars reads bar %d..%d (expect 3), after: %d bars; manual 7-pulse loop whole-bars %d (expect 0)  %s\n",
+               lo, hi, r.d.getBars(), m.d.getBarsWhole(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+    }
+    return fails ? 1 : 0;
+}
+
+static int t_stoprec()
+{
+    int fails = 0;
+    auto stopGate = [](SyncRig &r, float g) { Ctl c[] = {{"Stop", g}}; setInputs(r.d, c, 1); };
+    {   // free
+        SyncRig r(false);
+        r.run(20, 0.3f);
+        r.run(1, 0.3f, r.t + 50);                     // REC: recording
+        r.run(40, 0.3f);
+        const int s0 = r.stateAt.back();
+        stopGate(r, 1.0f); r.run(3, 0.3f);           // closed at once; held once the 5 ms fade is out
+        const int s1 = r.stateAt.back(), L = r.d.getLoopSamples();
+        r.run(20, 0.0f);
+        const int s2 = r.stateAt.back();
+        double held = 0; for (size_t i = r.out.size() - 10 * FRAMELENGTH; i < r.out.size(); ++i) held = fmax(held, fabs(r.out[i]));
+        stopGate(r, 0.0f); r.run(10, 0.0f);
+        double play = 0; for (size_t i = r.out.size() - 5 * FRAMELENGTH; i < r.out.size(); ++i) play = fmax(play, fabs(r.out[i]));
+        const bool ok = s0 == 1 && s1 == 4 && L > 30 * FRAMELENGTH && L < 42 * FRAMELENGTH && s2 == 4 && held == 0.0 && play > 0.25 && r.stateAt.back() == 2;
+        printf("stoprec: free -> state %d, stop: state %d (STOP=4) loop %d, held peak %.4f, released: peak %.3f state %d  %s\n",
+               s0, s1, L, held, play, r.stateAt.back(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+    }
+    {   // sync, Bars 0 (manual): closes on the next pulse, a whole number of pulses
+        SyncRig r(true);
+        r.bars(0.0f);
+        r.run(20, 0.3f);
+        r.run(1, 0.3f, r.t + 50);                     // armed; starts on the next pulse
+        r.blocksTo(r.t + 5 * r.Q + r.Q / 3, 0.3f);    // mid-pulse
+        const int s0 = r.stateAt.back();
+        stopGate(r, 1.0f); r.run(1, 0.3f);
+        const int s1 = r.stateAt.back();             // still recording to the pulse
+        r.blocksTo(r.t + r.Q, 0.3f);
+        const int L = r.d.getLoopSamples(), s2 = r.stateAt.back();
+        const bool whole = L > 0 && L % r.Q == 0;
+        stopGate(r, 0.0f); r.run(10, 0.0f);
+        const bool ok = s0 == 1 && s1 == 1 && s2 == 4 && whole && r.stateAt.back() == 2;
+        printf("stoprec: sync -> stop mid-pulse: state %d, then %d (STOP=4), loop %d = %d pulses (whole %d), released: state %d  %s\n",
+               s1, s2, L, L / r.Q, (int)whole, r.stateAt.back(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+    }
+    {   // a running dub punches out
+        SyncRig r(false);
+        r.run(20, 0.3f); r.run(1, 0.3f, r.t + 50); r.run(40, 0.3f); r.run(1, 0.3f, r.t + 50);   // record, close
+        r.run(10, 0.3f); r.run(1, 0.3f, r.t + 50);   // dub
+        r.run(5, 0.3f);
+        const int s0 = r.stateAt.back();
+        stopGate(r, 1.0f); r.run(10, 0.3f);
+        const int s1 = r.stateAt.back();
+        stopGate(r, 0.0f); r.run(10, 0.3f);
+        const bool ok = s0 == 3 && s1 == 4 && r.stateAt.back() == 2;
+        printf("stoprec: dub -> state %d, stop: %d, released: %d (play, not dub)  %s\n", s0, s1, r.stateAt.back(), ok ? "ok" : "FAIL");
+        if (!ok) ++fails;
+    }
+    return fails ? 1 : 0;
+}
+
 static int t_nan()
 {
     const float poisons[] = { NAN, INFINITY, -INFINITY };
     const char *ports[] = { "Left In", "Right In", "Rec", "Speed", "SOS", "Dry", "Level",
-                            "V/Oct", "Extend", "Stop", "Undo", "Clk" };
+                            "V/Oct", "Extend", "Stop", "Undo", "Clk", "Dub", "Bars" };
     int fails = 0;
     for (const char *port : ports) for (float p : poisons) {
         Noether d(2);
@@ -1465,6 +2263,12 @@ int main(int argc, char **argv)
     else if (!strcmp(m, "tri"))    r = t_tri();
     else if (!strcmp(m, "bars"))   r = t_bars();
     else if (!strcmp(m, "dub"))    r = t_dub();
+    else if (!strcmp(m, "close"))  r = t_close();
+    else if (!strcmp(m, "seamq"))  r = t_seamq();
+    else if (!strcmp(m, "clean"))  r = t_clean();
+    else if (!strcmp(m, "syncdub")) r = t_syncdub();
+    else if (!strcmp(m, "stoprec")) r = t_stoprec();
+    else if (!strcmp(m, "barview")) r = t_barview();
     else if (!strcmp(m, "extend")) r = t_extend();
     else if (!strcmp(m, "voct"))   r = t_voct();
     else if (!strcmp(m, "persist")) r = t_persist();

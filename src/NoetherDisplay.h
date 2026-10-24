@@ -52,6 +52,13 @@ public:
         }
         mLastWrite = w;
 
+        // and the zeroing after a clear (0.8.5: done by the audio thread a
+        // slice per block, so the view follows it the same way)
+        const int z = h->vizZeroed();
+        if (z < mLastZero) mLastZero = 0;
+        if (z > mLastZero) mSampleView.invalidateInterval(mLastZero, z);
+        mLastZero = z;
+
         // the loop is the marked region
         const int L = h->getLoopSamples();
         mSampleView.setMarkedRegion(0, L > 0 ? L : 0);
@@ -71,6 +78,7 @@ public:
     }
 
     int mLastWrite = 0;
+    int mLastZero = 0;
 #endif
 };
 

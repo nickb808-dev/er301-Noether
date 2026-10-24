@@ -26,9 +26,12 @@ struct Sample {
     float    mSampleRate      = 48000.0f;
     bool     mDirty           = false;
     void setDirty() { mDirty = true; }
+    void setClean() { mDirty = false; }   // SDK Sample.h: setClean()
     void zero() { if (mpData) for (uint32_t i = 0; i < mSampleCount * mChannelCount; ++i) mpData[i] = 0.0f; mDirty = true; }
 
     // Test helper: mark the buffer fully loaded (the SDK's setMemoryOnly()).
-    void setMemoryOnly() { mSampleLoadCount = mSampleCount; }
+    // and, as the SDK's does, marks it dirty: every new pool buffer starts
+    // "unsaved" (which is what makes a quicksave ask about it)
+    void setMemoryOnly() { mSampleLoadCount = mSampleCount; mDirty = true; }
 };
 } // namespace od

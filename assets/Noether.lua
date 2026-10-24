@@ -33,7 +33,7 @@ local libnoether = require "noether.libnoether"
 
 -- THE RUNNING VERSION, ON SCREEN (standard §10c). tools/check-version.sh
 -- fails the build if this drifts from the Makefile or toc.lua.
-local VERSION = "0.8.3"
+local VERSION = "0.8.14"
 
 -- Default loop buffer length. Changed from the menu (10 / 30 / 60 s).
 local kDefaultSecs = 30
@@ -79,6 +79,12 @@ function Noether:onLoadGraph(channelCount)
   local rec = self:addObject("rec", app.Comparator())
   connect(rec, "Out", head, "Rec")
   self:addMonoBranch("rec", rec, "In", rec, "Out")
+
+  -- DUB (0.8.10): a trigger. Overdub in / out the moment it is pressed,
+  -- whatever the sync mode — rec in sync mode waits for the bar line.
+  local dub = self:addObject("dub", app.Comparator())
+  connect(dub, "Out", head, "Dub")
+  self:addMonoBranch("dub", dub, "In", dub, "Out")
 
   -- UNDO: a trigger. Swaps the last overdub / extend pass out; again = redo.
   local undo = self:addObject("undo", app.Comparator())
@@ -137,9 +143,15 @@ function Noether:setSample(sample)
     self.sample = nil
   end
   self.sample = sample
+  -- 0.8.8: Noether saves its loop itself, so its OWN buffer is kept
+  -- "saved" (clean) and no quicksave asks about it; a buffer the player
+  -- attached from the pool is theirs, and keeps the normal prompt
+  local keep = self.keepClean ~= false
+  self.objects.head:setKeepClean(keep and 1 or 0)
   if self.sample then
     self.sample:claim(self)
     self.objects.head:setSample(sample.pSample)
+    if keep then sample:setClean() end
   else
     self.objects.head:setSample(nil)
   end
@@ -163,6 +175,7 @@ function Noether:setUndoBuffer(sample)
   self.undoSample = sample
   if sample then
     sample:claim(self)
+    sample:setClean()                 -- Noether's alone; never worth a save prompt
     self.objects.head:setUndoSample(sample.pSample)
   else
     self.objects.head:setUndoSample(nil)
@@ -180,6 +193,7 @@ function Noether:createBuffer(secs)
   }
   if sample then
     self.bufferSecs = secs
+    self.keepClean = true
     self:setSample(sample)
     self.ownBuffer = sample
   else
@@ -228,6 +242,7 @@ function Noether:doAttachBufferFromPool()
   chooser:highlight(self.sample)
   chooser:subscribe("done", function(sample)
     if sample then
+      self.keepClean = false          -- the player's buffer: keep its save prompt
       self:setSample(sample)
       self:matchUndoBuffer(sample)
       Overlay.flashMainMessage("Attached buffer: %s", sample.name)
@@ -310,23 +325,65 @@ function Noether:sampleStatusChanged(sample)
     self.savingSample = nil
     self:setPersistStatus("saved %s", Path.getFilename(sample.path or "?"))
     if sample.userCount == 0 then SamplePool.unload(sample) end
-  elseif sample == self.pendingLoop and not sample:isPending() then
-    self.pendingLoop = nil
-    local ok, n = pcall(function() return self.objects.head:importLoop(sample.pSample) end)
-    if ok and n and n > 0 then
-      self.loopRevSaved = self.objects.head:getLoopRev()
-      self:setPersistStatus("loaded %d frames, state %d", n, self.objects.head:getState())
+  elseif sample == self.pendingLoop or sample == self.sample then
+    if sample:isPending() then
+      if sample == self.pendingLoop then
+        self:setPersistStatus("loading %s", Path.getFilename(sample.path or "?"))
+      end
     else
-      -- say what the engine saw, not just that it said no
-      local ch = sample.getChannelCount and sample:getChannelCount() or -1
-      local len = sample.length and sample:length() or -1
-      local st = sample.getStatusText and sample:getStatusText() or "?"
-      self:setPersistStatus("refused %s: ch %s len %s st %s %s", tostring(n), tostring(ch), tostring(len), tostring(st), tostring(sample.reason or ""))
-      app.logError("%s: loop file did not import (%s)", self, self.persistStatus)
+      self:tryRestore()
     end
-    if sample.userCount == 0 then SamplePool.unload(sample) end
-  elseif sample == self.pendingLoop then
-    self:setPersistStatus("loading %s", Path.getFilename(sample.path or "?"))
+  end
+end
+
+-- Bring the loop back once BOTH files are in (0.8.7). After a reboot the
+-- loop buffer itself can be loading from the card — when the player saved
+-- it at the quicksave prompt — while the loop file loads beside it.
+-- Importing into a buffer still loading lost the loop (the engine saw the
+-- unloaded buffer and dropped to EMPTY; the pool then finished filling it:
+-- "I see the audio content but it's not playing"). So: wait for the buffer,
+-- then import the loop file; if there is no usable loop file but the buffer
+-- came back from a saved file, play its first loopLen frames.
+function Noether:tryRestore()
+  -- nothing outstanding (e.g. the buffer was just saved from the editor)
+  if not self.pendingLoop and not self.restoreLen then return end
+  local head = self.objects.head
+  local buf = self.sample
+  if buf and buf:isPending() then
+    self:setPersistStatus("waiting for the buffer to load")
+    return
+  end
+  local s = self.pendingLoop
+  if s then
+    if s:isPending() then return end
+    self.pendingLoop = nil
+    local ok, n = pcall(function() return head:importLoop(s.pSample) end)
+    if s.userCount == 0 then SamplePool.unload(s) end
+    if ok and n and n > 0 then
+      self.loopRevSaved = head:getLoopRev()
+      self.restoreLen = nil
+      self:setPersistStatus("loaded %d frames, state %d", n, head:getState())
+      return
+    end
+    -- say what the engine saw, not just that it said no
+    local ch = s.getChannelCount and s:getChannelCount() or -1
+    local len = s.length and s:length() or -1
+    local st = s.getStatusText and s:getStatusText() or "?"
+    self:setPersistStatus("refused %s: ch %s len %s st %s %s", tostring(n), tostring(ch), tostring(len), tostring(st), tostring(s.reason or ""))
+    app.logError("%s: loop file did not import (%s)", self, self.persistStatus)
+  end
+  -- no loop file, or it would not import: a buffer restored from a saved
+  -- file still holds the loop at its start
+  local L = self.restoreLen
+  self.restoreLen = nil
+  if L and L > 0 and buf and buf:isFileBased() then
+    local n = head:playBuffer(L)
+    if n and n > 0 then
+      self.loopRevSaved = -1          -- the loop file is re-written at the next save
+      self:setPersistStatus("playing the saved buffer: %d frames", n)
+    else
+      self:setPersistStatus("saved buffer refused: %s", tostring(n))
+    end
   end
 end
 
@@ -340,7 +397,7 @@ function Noether:loadLoopFromCard()
   if not s then self:setPersistStatus("load failed: %s", tostring(status)); return end
   self.pendingLoop = s
   self:setPersistStatus("load queued (%s)", s:isPending() and "pending" or "ready")
-  if not s:isPending() then self:sampleStatusChanged(s) end
+  self:tryRestore()                   -- now, or when the last file arrives
 end
 
 function Noether:serialize()
@@ -349,9 +406,12 @@ function Noether:serialize()
     t.sample = SamplePool.serializeSample(self.sample)
   end
   t.bufferSecs = self.bufferSecs
+  t.keepClean = self.keepClean ~= false
   local head = self.objects.head
   t.syncN = head:getSyncN()
+  t.ppb = head:getPulsesPerBar()
   if head:getLoopSamples() > 0 then
+    t.loopLen = head:getLoopSamples()   -- 0.8.7: lets a saved buffer play on its own
     if self.loopPath == nil or head:getLoopRev() ~= self.loopRevSaved then
       self:saveLoopToCard()
     end
@@ -363,7 +423,9 @@ end
 function Noether:deserialize(t)
   Unit.deserialize(self, t)
   if t.bufferSecs then self.bufferSecs = t.bufferSecs end
+  self.keepClean = t.keepClean ~= false
   if t.syncN then self.objects.head:setSyncN(t.syncN) end
+  if t.ppb then self.objects.head:setPulsesPerBar(t.ppb) end
   if t.sample then
     local sample = SamplePool.deserializeSample(t.sample, self.chain)
     if sample then
@@ -373,9 +435,13 @@ function Noether:deserialize(t)
       app.logError("%s:deserialize: failed to load sample.", self)
     end
   end
+  self.restoreLen = t.loopLen
   if t.loopPath then
     self.loopPath = t.loopPath
     self:loadLoopFromCard()
+    if not self.pendingLoop then self:tryRestore() end   -- missing file: try the saved buffer
+  elseif t.loopLen then
+    self:tryRestore()
   else
     self:setPersistStatus("preset carries no loop file")
   end
@@ -390,8 +456,14 @@ end
 -- ── menu ────────────────────────────────────────────────────────────────
 -- Tasks, not OptionControls: creating a buffer allocates, which the audio
 -- thread may never do (standard §2 / §3).
+-- Pulses per bar (0.8.9): the clock's resolution, set once at the target so
+-- Bars counts bars. Tasks with the current one marked, as the buffer
+-- lengths below (an OptionControl shows three choices at most, §7).
+local kPpb = { 1, 2, 3, 4, 6, 8, 12, 16, 24, 96 }
+
 local menu = {
   "clockHeader", "sync",
+  "ppbHeader", "ppb1", "ppb2", "ppb3", "ppb4", "ppb6", "ppb8", "ppb12", "ppb16", "ppb24", "ppb96",
   "bufferHeader", "buf10", "buf30", "buf60",
   "loopHeader", "clearLoop", "attachExisting", "editBuffer", "reloadLoop",
 }
@@ -408,6 +480,19 @@ function Noether:onShowMenu(objects, branches)
     choices     = { "free", "sync" },
     descriptionWidth = 2,
   }
+  controls.ppbHeader = MenuHeader { description = "Clock pulses per bar" }
+  local curPpb = self.objects.head:getPulsesPerBar()
+  for _, n in ipairs(kPpb) do
+    local label = tostring(n)
+    controls["ppb" .. n] = Task {
+      description = (curPpb == n) and (label .. "  <") or label,
+      task = function()
+        self.objects.head:setPulsesPerBar(n)
+        Overlay.flashMainMessage("Bars count %d clock pulses each", n)
+      end,
+    }
+  end
+
   controls.bufferHeader = MenuHeader { description = "Loop buffer" }
   local cur = self.bufferSecs or kDefaultSecs
   local function bufTask(name, secs)
@@ -450,7 +535,7 @@ end
 -- ── views ───────────────────────────────────────────────────────────────
 -- The Reel is the in-context graphic for every control; the waveform view
 -- sits beside it in the expanded view (and is where the editor opens from).
-local controlOrder = { "rec", "undo", "stop", "clk", "bars", "ext", "speed", "voct", "sos", "dry", "level" }
+local controlOrder = { "rec", "dub", "undo", "stop", "clk", "bars", "ext", "speed", "voct", "sos", "dry", "level" }
 local views = { expanded = { "reel", "wave" }, collapsed = {} }
 for _, name in ipairs(controlOrder) do
   views.expanded[#views.expanded + 1] = name
@@ -467,6 +552,8 @@ function Noether:onLoadViews(objects, branches)
 
   controls.rec = Gate { button = "rec", description = "rec / close / overdub",
                         branch = branches.rec, comparator = objects.rec }
+  controls.dub = Gate { button = "dub", description = "overdub in / out now (rec in sync waits for the bar)",
+                        branch = branches.dub, comparator = objects.dub }
   controls.undo = Gate { button = "undo", description = "undo last pass (again = redo)",
                          branch = branches.undo, comparator = objects.undo }
   controls.stop = Gate { button = "stop", description = "stop (latched): fades out, holds the head",
@@ -497,14 +584,15 @@ function Noether:onLoadViews(objects, branches)
   local speedMap = app.LinearDialMap(-2, 2); speedMap:setCoarseRadix(16)
   gb("speed", "speed", "Speed: -2x .. 0 (stop) .. +2x", speedMap, 1.0,
      app.LinearDialMap(-2, 2))
-  -- whole bars: rounding 1 snaps every step to an integer, coarse radix 64
-  -- makes a coarse click exactly one bar over the 0..64 range
-  local barsMap = app.LinearDialMap(0, 64); barsMap:setRounding(1); barsMap:setCoarseRadix(64)
+  -- whole bars: rounding 1 snaps every step to an integer, coarse radix 16
+  -- makes a coarse click exactly one bar over the 0..16 range (0.8.13: 64
+  -- was more than anyone manages musically — Nick)
+  local barsMap = app.LinearDialMap(0, 16); barsMap:setRounding(1); barsMap:setCoarseRadix(16)
   controls.bars = GainBias {
-    button = "bars", description = "sync: close the take after N pulses (0 = manual)",
+    button = "bars", description = "sync: close after N bars (menu: pulses per bar; 0 = manual)",
     branch = branches.bars, gainbias = objects.barsParam, range = objects.barsRange,
     biasMap = barsMap, biasPrecision = 0, initialBias = 0,
-    gainMap = app.LinearDialMap(-64, 64),
+    gainMap = app.LinearDialMap(-16, 16),
   }
   gb("sos",   "sos",   "SOS: 0 replace .. 1 keep loop", Encoder.getMap("[0,1]"), 0.5)
   gb("dry",   "dry",   "Live input level", Encoder.getMap("[0,1]"), 1.0)

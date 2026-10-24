@@ -102,13 +102,31 @@ public:
             const int cur = (int)((long)h->vizPos() * sec / L) + 1;
             // clocked: bar X / Y (the edge phase over the loop's periods);
             // otherwise the section the head is in
+            // a loop that is not a whole number of bars counts pulses: "beat"
+            // (until 0.8.14 those pulses were labelled "bar" too); extending:
+            // the bar being added, of what it will be (manual: so far)
             const int bars = h->getBars();
-            if (bars > 0 && h->hasClock()) snprintf(buf, sizeof buf, "%.2f s  bar %d/%d", (double)h->getLoopSeconds(), h->getBar(), bars);
+            if (bars > 0 && h->hasClock()) {
+                const char *unit = h->getBarsWhole() ? "bar" : "beat";
+                if (h->getState() == Noether::EXTEND)
+                    snprintf(buf, sizeof buf, "ext  bar %d/%d .%d", h->getBar(), bars, h->getBeat());
+                else if (h->getBeat() > 0) snprintf(buf, sizeof buf, "%.2f s  bar %d/%d .%d", (double)h->getLoopSeconds(), h->getBar(), bars, h->getBeat());
+                else                  snprintf(buf, sizeof buf, "%.2f s  %s %d/%d", (double)h->getLoopSeconds(), unit, h->getBar(), bars);
+            }
             else                           snprintf(buf, sizeof buf, "%.2f s   %d/%d%s", (double)h->getLoopSeconds(), cur, sec, h->hasClock() ? "  clk" : "");
-            fb.text(GRAY9, x0 + 4, y0 + 4, buf, 10);
+            // 0.8.10: a sync overdub takes the line while it is armed / counted
+            const int dubArm = h->getDubArmed();
+            if (dubArm == 1)      { fb.text(WHITE, x0 + 4, y0 + 4, "dub in at next bar", 10); }
+            else if (dubArm == 2) { fb.text(WHITE, x0 + 4, y0 + 4, "dub out at next bar", 10); }
+            else if (h->getDubBars() > 0) {
+                snprintf(buf, sizeof buf, "dub bar %d/%d", h->getDubBar(), h->getDubBars());
+                fb.text(WHITE, x0 + 4, y0 + 4, buf, 10);
+            }
+            else fb.text(GRAY9, x0 + 4, y0 + 4, buf, 10);
         } else {
             if (h->getBars() > 0) {
-                snprintf(buf, sizeof buf, "rec  bar %d/%d", h->getBar(), h->getBars());
+                if (h->getBeat() > 0) snprintf(buf, sizeof buf, "rec  bar %d/%d .%d", h->getBar(), h->getBars(), h->getBeat());
+                else                  snprintf(buf, sizeof buf, "rec  bar %d/%d", h->getBar(), h->getBars());
                 fb.text(WHITE, x0 + 4, y0 + 4, buf, 10);
             } else if (h->getState() == Noether::RECORD) {
                 fb.text(GRAY7, x0 + 4, y0 + 4, h->isArmed() ? "rec  (closes on clk)" : "rec", 10);

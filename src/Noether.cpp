@@ -21,6 +21,7 @@ Noether::Noether(int channelCount)
     addOutput(mLeftOut);
     addOutput(mRightOut);
     addInput(mRecIn);
+    addInput(mDubIn);
     addInput(mStopIn);
     addInput(mUndoIn);
     addInput(mClkIn);
@@ -77,7 +78,8 @@ void Noether::setSample(od::Sample *sample)
 }
 
 void Noether::clearLoop()          { mClearRequested = true; }
-void Noether::zeroBuffer()         { if (mpSample) mpSample->zero(); }
+void Noether::setKeepClean(int on) { mKeepClean = (on != 0); }
+void Noether::zeroBuffer()         { mZeroRequested = true; }   // done by the audio thread, see process()
 int   Noether::isRestoring()       { return mRestoring ? 1 : 0; }
 int   Noether::canUndo()           { return (mUndoAvail && mpUndo && mpUndo->mChannelCount == (uint32_t)mNc) ? 1 : 0; }
 
@@ -162,7 +164,7 @@ void Noether::restoreSome(float *d)
         if (mRestPos < 0) mRestPos = span - 1;
         --mRestLeft; --n;
     }
-    if (mRestLeft <= 0) { mRestoring = false; ++mLoopRev; if (mpSample) mpSample->setDirty(); }
+    if (mRestLeft <= 0) { mRestoring = false; ++mLoopRev; markDirty(mpSample); }
 }
 int   Noether::getState()          { return (mState == PLAY && mStopped && mPlayLvl <= 0.0f) ? (int)STOP : (int)mState; }
 int   Noether::getLoopSamples()    { return mLoopLen; }
@@ -172,26 +174,95 @@ void  Noether::setSeamMatch(int on){ mSeamMatch = (on != 0); }
 int   Noether::getSeamMatch()      { return mSeamMatch ? 1 : 0; }
 int   Noether::getLoopRev()        { return mLoopRev; }
 int   Noether::getDetent()         { return mDetent ? 1 : 0; }
-int   Noether::getSections()       { return (mSyncN > 0 && mSyncOpt.value() == 2) ? mSyncN : kSections; }
+int   Noether::getSections()
+{
+    // a clocked loop's ticks mark BARS when it is a whole number of them
+    // (0.8.9: 64 pulse ticks for 4 bars of 16ths would just be a grey ring)
+    if (!(mSyncN > 0 && mSyncOpt.value() == 2)) return kSections;
+    const int ppb = mPpb > 0 ? mPpb : 1;
+    return (ppb > 1 && mSyncN % ppb == 0) ? mSyncN / ppb : mSyncN;
+}
 void  Noether::setSyncN(int n)     { mSyncN = (n > 0 && n < 1024) ? n : 0; mEdgePhase = 0; }
 int   Noether::getSyncN()          { return mSyncN; }
 int   Noether::isArmed()           { return mArmed; }
 int   Noether::hasClock()          { return mClkSince < kClkTimeout ? 1 : 0; }
+// The bar readouts (UI thread: the divides here never run on the audio
+// thread). While a counted take records: bars taken / the count. While a
+// clocked loop plays: the bar the PLAY HEAD is in / the loop's bars — in
+// pulses when the loop is not a whole number of bars (a manual take can
+// close on any pulse; the display then says "beat"). While held: where the
+// clock will bring it back in. While extending: the bar being added.
+// Until 0.8.14 the playing readout counted clock pulses (mEdgePhase): right
+// at 1x only — at 0.5x it showed bar 2 while the downbeat re-sync kept the
+// head in bar 1, it ran on while stopped, and it froze during an extension.
+void  Noether::setPulsesPerBar(int n) { mPpb = n < 1 ? 1 : (n > 96 ? 96 : n); }
+int   Noether::getPulsesPerBar()      { return mPpb; }
+// the pulse (0 .. N-1) a readout shows, or -1 when there is none
+int   Noether::readoutPulse()
+{
+    if (!(mSyncN > 0 && mSyncOpt.value() == 2 && mLoopLen > 0)) return -1;
+    if (mState == EXTEND) return mSyncN + mExtEdges;
+    if (mState != PLAY && mState != OVERDUB) return -1;
+    if (mStopped && mPlayLvl <= 0.0f) return mEdgePhase < mSyncN ? mEdgePhase : mSyncN - 1;
+    long p = (long)mVizPos * mSyncN / mLoopLen;
+    if (p < 0) p = 0;
+    if (p >= mSyncN) p = mSyncN - 1;
+    return (int)p;
+}
 int   Noether::getBar()
 {
+    const int ppb = mPpb > 0 ? mPpb : 1;
     if (mState == RECORD && mBars > 0 && mSyncOpt.value() == 2) {
-        int b = mClkCount - mClkAtStart + 1;
+        const int b = (mClkCount - mClkAtStart) / ppb + 1;
         return b > mBars ? mBars : b;
     }
-    if (mState == RECORD) return 0;
-    if (mSyncN > 0 && mSyncOpt.value() == 2 && mLoopLen > 0) return mEdgePhase + 1;
-    return 0;
+    const int p = readoutPulse();
+    if (p < 0) return 0;
+    if (mState == EXTEND) return p / ppb + 1;
+    return (mSyncN % ppb == 0) ? p / ppb + 1 : p + 1;
 }
 int   Noether::getBars()
 {
+    const int ppb = mPpb > 0 ? mPpb : 1;
     if (mState == RECORD) return (mBars > 0 && mSyncOpt.value() == 2) ? mBars : 0;
-    if (mSyncN > 0 && mSyncOpt.value() == 2 && mLoopLen > 0) return mSyncN;
-    return 0;
+    if (!(mSyncN > 0 && mSyncOpt.value() == 2 && mLoopLen > 0)) return 0;
+    if (mState == EXTEND) {
+        // counted: what it will be; manual: what it is so far (whole bars)
+        const int total = mSyncN + (mBars > 0 ? mBars * ppb : mExtEdges);
+        const int b = (total + ppb - 1) / ppb;
+        return b > 0 ? b : 1;
+    }
+    return (mSyncN % ppb == 0) ? mSyncN / ppb : mSyncN;
+}
+int   Noether::getBarsWhole()
+{
+    const int ppb = mPpb > 0 ? mPpb : 1;
+    if (mState == RECORD || mState == EXTEND) return 1;
+    return (ppb < 2 || mSyncN % ppb == 0) ? 1 : 0;
+}
+int   Noether::getDubArmed() { return mDubArm; }
+int   Noether::getDubBars()
+{
+    const int ppb = mPpb > 0 ? mPpb : 1;
+    return (mState == OVERDUB && mDubTotal > 0) ? mDubTotal / ppb : 0;
+}
+int   Noether::getDubBar()
+{
+    const int ppb = mPpb > 0 ? mPpb : 1;
+    if (!(mState == OVERDUB && mDubTotal > 0)) return 0;
+    const int b = (mDubTotal - mDubLeft) / ppb + 1;
+    const int n = mDubTotal / ppb;
+    return b > n ? n : b;
+}
+int   Noether::getBeat()
+{
+    const int ppb = mPpb > 0 ? mPpb : 1;
+    if (ppb < 2 || mSyncOpt.value() != 2) return 0;
+    if (mState == RECORD) return mBars > 0 ? (mClkCount - mClkAtStart) % ppb + 1 : 0;
+    const int p = readoutPulse();
+    if (p < 0) return 0;
+    if (mState == EXTEND) return p % ppb + 1;
+    return (mSyncN % ppb == 0) ? p % ppb + 1 : 0;
 }
 
 // A clock edge, at its sample. Free mode: restart the loop (a reset
@@ -223,7 +294,7 @@ void Noether::onClockEdge()
     }
     // A counted take closes itself on the edge that completes the count;
     // a second REC press (mArmed == 2) still closes early on the next edge.
-    if (mState == RECORD && mArmed != 2 && mBars > 0 && mClkCount - mClkAtStart >= mBars)
+    if (mState == RECORD && mArmed != 2 && mBars > 0 && mClkCount - mClkAtStart >= mBars * mPpb)
         mArmed = 2;
     if (mArmed == 2 && mState == RECORD) {
         mSyncN = mClkCount - mClkAtStart;
@@ -235,15 +306,70 @@ void Noether::onClockEdge()
         mEdgePhase = 0;                      // this edge IS the downbeat
         return;
     }
+    // EXTEND under the clock (0.8.10): count its pulses and bar lines; it
+    // closes ON the clock — at the next bar line after a REC press, or by
+    // itself after Bars bars — and the loop's pulse count grows by them
+    if (mState == EXTEND) {
+        // the downbeat AT the extension's start is its boundary, not its
+        // first pulse: at 1x the head runs off the end one sample before
+        // that edge (it advances after the read), so the edge lands just
+        // inside EXTEND — counted, Bars 1 added 3 pulses, not 4 (host)
+        if (mExtEdges == 0 && mWrite - mLoop0 < kSyncTol) return;
+        ++mExtEdges;
+        if (++mExtBeat >= mPpb) mExtBeat = 0;
+        if ((mExtArm && mExtBeat == 0) || (mBars > 0 && mExtEdges >= mBars * mPpb))
+            closeExtendExact();
+        return;
+    }
     if ((mState == PLAY || mState == OVERDUB) && mSyncN > 0) {
         ++mEdgePhase;
         if (mEdgePhase >= mSyncN) {          // the N-th edge: the downbeat
             mEdgePhase = 0;
             const int L = mLoopLen;
-            if (L > 0 && !(mRead < (double)kSyncTol || mRead > (double)(L - kSyncTol)))
+            // held (stop): the head stays put; the release puts it where the
+            // clock is (process, 0.8.14) — until then this moved a silent head
+            const bool held = mStopped && mPlayLvl <= 0.0f;
+            if (!held && L > 0 && !(mRead < (double)kSyncTol || mRead > (double)(L - kSyncTol)))
                 beginJump(0.0, mRead);
         }
+        // bar lines of the loop, counted from its downbeat (a counter, no %)
+        if (mEdgePhase == 0) mBeatInBar = 0;
+        else if (++mBeatInBar >= mPpb) mBeatInBar = 0;
+        const bool barLine = mBeatInBar == 0;
+        // OVERDUB AS A CLOCKED TAKE (0.8.10): a counted overdub punches out
+        // by itself after Bars bars; an armed one punches in / out on a bar
+        if (mState == OVERDUB && mDubLeft > 0 && --mDubLeft == 0) {
+            mRecGoal = 0.0f; mDubArm = 0;
+        }
+        if (mDubArm == 1 && mState == PLAY && barLine) {
+            beginPass(); mState = OVERDUB; mRecGoal = 1.0f; mDubArm = 0;
+            mDubTotal = mDubLeft = (mBars > 0) ? mBars * mPpb : 0;
+        } else if (mDubArm == 2 && mState == OVERDUB && barLine) {
+            mRecGoal = 0.0f; mDubArm = 0; mDubLeft = 0;
+        }
     }
+}
+
+// Sync mode: an extension closes ON the clock (0.8.10). Until 0.8.9 it
+// closed the free way (a phase-matched cut anywhere) and KEPT the old pulse
+// count, so every old-N pulses the downbeat re-sync yanked the longer loop
+// back to its start. Now: the exact length at this edge, N grows by the
+// extension's pulses, this edge is the new downbeat. No pre-roll seam (the
+// head has been overdubbed since the take): the clocked head blend.
+void Noether::closeExtendExact()
+{
+    const double from = (double)(mWrite - mLoop0);
+    mSyncN += mExtEdges;
+    if (mSyncN > 1023) mSyncN = 1023;
+    closeLoopExact(false);
+    if (mState == EXTEND && mLoopLen > 0 && from >= 0.0 && from < (double)mLoopLen)
+        beginJump(0.0, from, kJumpOut);
+    if (mState == EXTEND) { mState = PLAY; mRecGoal = 0.0f; mRecLvl = 0.0f; }
+    mUndoLenB = mLoopLen;
+    mUndoAvail = true;
+    mEdgePhase = 0; mBeatInBar = 0;
+    mExtArm = false; mExtEdges = 0; mExtBeat = 0;
+    mDubArm = 0; mDubLeft = 0; mDubTotal = 0;
 }
 
 // UI thread. Copies the loop [0, L) into dst; dst was allocated by Lua with
@@ -287,7 +413,12 @@ int Noether::importLoop(od::Sample *src)
     const int ns = (int)src->mChannelCount, nd = (int)dst->mChannelCount;
     if (ns < 1 || ns > kMaxCh || nd < 1 || nd > kMaxCh) return -3;
     int n = (int)avail;
-    uint32_t cap = dst->mSampleLoadCount < dst->mSampleCount ? dst->mSampleLoadCount : dst->mSampleCount;
+    // 0.8.7: never into a buffer that is still LOADING (a buffer the player
+    // saved at quicksave time comes back from its file after a reboot): the
+    // pool's loader would overwrite the copy, or the engine would see the
+    // unloaded buffer and drop to EMPTY — the loop then "visible, not playing"
+    if (dst->mSampleLoadCount < dst->mSampleCount) return -5;
+    uint32_t cap = dst->mSampleCount;
     if ((uint32_t)n > cap) n = (int)cap;
     if (n < 4) return -4;
 
@@ -303,7 +434,29 @@ int Noether::importLoop(od::Sample *src)
     mLoopLen = n;
     mRead = 0.0; mJumpCount = 0;
     ++mLoopRev;
-    dst->setDirty();
+    markDirty(dst);
+    mHandover = kHandover;              // fade in, like a closed take (enterPlay)
+    mState = PLAY;
+    return n;
+}
+
+int Noether::playBuffer(int frames)
+{
+    od::Sample *dst = mpSample;
+    if (!dst || !dst->mpData) return -2;
+    if (dst->mSampleLoadCount < dst->mSampleCount) return -5;
+    const int nd = (int)dst->mChannelCount;
+    if (nd < 1 || nd > kMaxCh) return -3;
+    int n = frames;
+    if ((uint32_t)n > dst->mSampleCount) n = (int)dst->mSampleCount;
+    if (n < 4) return -4;
+    enterEmpty();                       // the audio thread lets go, then the loop is published
+    mNc = nd;
+    mCap = (int)dst->mSampleCount;
+    mLoopLen = n;
+    mRead = 0.0; mJumpCount = 0;
+    ++mLoopRev;
+    mHandover = kHandover;              // fade in, like any loop that starts
     mState = PLAY;
     return n;
 }
@@ -317,6 +470,7 @@ void Noether::enterEmpty()
     mRestoring = false;
     mTailLeft = 0; mFirstTake = false;
     mWValid = false;
+    mPreCount = 0;          // the pre-roll restarts: nothing before EMPTY precedes the next take
     mState = EMPTY;
     if (mLoopLen > 0) ++mLoopRev;
     mLoopLen = 0;
@@ -345,16 +499,24 @@ void Noether::enterRecord()
                                  // blend takes care of both ends
 }
 
+// Only ever called when a FIRST TAKE closes (manual, clocked, buffer full).
+// While recording the loop is silent and only the input is monitored; at the
+// close the loop starts from its head, whose first sample is whatever was
+// recorded there — generally out of phase with the live input. 0.8.3 started
+// it at full level (a step); 0.8.4 faded it in over the 5 ms linear ramp,
+// still a thump on low tones (shorter than their period, cornered ends).
+// Now a smoothstep handover over kHandover (21 ms), dry level included.
 void Noether::enterPlay()
 {
     mState = PLAY;
     mRecGoal = 0.0f;
+    mHandover = kHandover;   // 0.8.5: a 21 ms smoothstep, not the 5 ms linear ramp
 }
 
 // Blend the tail of the take into its head and shorten the loop by kSeam.
 // After this, buf[L] (the sample recorded right after the loop's last
 // sample) IS buf[0] at the seam, so the wrap is continuous.
-void Noether::closeLoop()
+void Noether::closeLoop(bool preRoll)
 {
     od::Sample *s = mpSample;
     if (!s || !s->mpData || mCap <= 0) { enterEmpty(); return; }
@@ -377,7 +539,11 @@ void Noether::closeLoop()
             L = findSeam(d, len - (kSeam > kMatchWin ? kSeam : kMatchWin));
         }
 #endif
-        blendSeam(d, L);
+        int F = kSeamClocked;
+        if (F > (L >> 1)) F = L >> 1;
+        if (F > mPreCount) F = mPreCount;
+        if (preRoll && F >= kPreMin) { preRollSeam(d, L, F); mSeamPre = 1; }   // 0.8.6: the downbeat untouched
+        else { blendSeam(d, L); mSeamPre = 0; }
         mLoopLen = L;
     } else {
         mLoopLen = len;
@@ -387,16 +553,16 @@ void Noether::closeLoop()
     mRead = 0.0;
     mJumpCount = 0;
     ++mLoopRev;
-    s->setDirty();
+    markDirty(s);
 }
 
 // The seam itself: crossfade buf[L..L+kSeam) INTO buf[0..kSeam), so the
 // sample after the loop's last one is what was recorded next.
-void Noether::blendSeam(float *d, int L)
+void Noether::blendSeam(float *d, int L, int len)
 {
     const int nc = mNc;
-    const float inv = 1.0f / (float)kSeam;
-    for (int k = 0; k < kSeam; ++k) {
+    const float inv = 1.0f / (float)len;
+    for (int k = 0; k < len; ++k) {
         const float t = ((float)k + 0.5f) * inv;
         const float w = t * t * (3.0f - 2.0f * t);   // head fade-in
         cow(d, k);
@@ -407,27 +573,120 @@ void Noether::blendSeam(float *d, int L)
     }
 }
 
+// Equal-power gains without libm (no trig on the audio thread, standard and
+// habitat memory): sin(pi/2 u) by its odd Taylor series to x^9, scaled so
+// u = 1 gives exactly 1; cos(pi/2 u) = sin(pi/2 (1 - u)). To x^7 only, the
+// series reaches 0.99985 at u = 1 — the fade never arrived at the pre-roll
+// and the residue was a corner at the wrap (host: 4x the sine's curvature).
+static inline float sinHalfPiRaw(float u)
+{
+    const float x = 1.57079633f * u, x2 = x * x;
+    return x * (1.0f - x2 * (1.0f / 6.0f - x2 * (1.0f / 120.0f - x2 * (1.0f / 5040.0f - x2 * (1.0f / 362880.0f)))));
+}
+static inline float sinHalfPi(float u)
+{
+    // 1 / sinHalfPiRaw(1) as a literal (float arithmetic, computed once off
+    // the device): a function-local static initialised by a call needs
+    // __cxa_guard_acquire / release at runtime — two new firmware imports
+    // for one constant, caught by the nm diff against 0.8.5
+    const float kNorm = 0.999996424f;
+    return u >= 1.0f ? 1.0f : sinHalfPiRaw(u) * kNorm;
+}
+
+// The pre-roll seam: buf[L-F+k] fades from the loop's own end toward the
+// pre-roll frame that preceded the take's start by F-k, so buf[L-1] is the
+// sample recorded just before buf[0] and the wrap is the recording's own
+// continuity. The head (the downbeat) is not written. The SHAPE follows the
+// correlation of the two signals over the window, both channels together
+// (previously DESIGN §5.2): correlated -> equal gain (equal power would peak
+// +3 dB: Noether 0.6.5 measured that on re-syncs), uncorrelated -> equal
+// power (equal gain dips 3 dB), a blend between. Compared as rho |rho|
+// against squared thresholds: no sqrt. Zero energy counts as correlated.
+void Noether::preRollSeam(float *d, int L, int F)
+{
+    const int nc = mNc;
+    const int oldest = (mPrePos - F) & (kPreRoll - 1);   // pre-roll frame for k = 0
+    double ab = 0.0, aa = 0.0, bb = 0.0;
+    for (int k = 0; k < F; ++k) {
+        const float *a = d + (size_t)(L - F + k) * nc;
+        const float *b = mPre + (size_t)((oldest + k) & (kPreRoll - 1)) * kMaxCh;
+        for (int c = 0; c < nc; ++c) { ab += (double)a[c] * b[c]; aa += (double)a[c] * a[c]; bb += (double)b[c] * b[c]; }
+    }
+    // rho |rho| = ab |ab| / (aa bb); equal gain at rho >= 0.7, equal power at
+    // rho <= 0.2, linear in rho^2 between
+    float m = 1.0f;                                 // 1 = equal gain
+    if (aa > 1.0e-12 && bb > 1.0e-12) {
+        const double r2 = ab * (ab < 0.0 ? -ab : ab) / (aa * bb);   // signed rho^2
+        const double lo = 0.04, hi = 0.49;
+        m = (float)(r2 <= lo ? 0.0 : (r2 >= hi ? 1.0 : (r2 - lo) / (hi - lo)));
+        mSeamRho = (float)r2;                       // signed rho^2
+    } else {
+        mSeamRho = 1.0f;
+    }
+    const float inv = 1.0f / (float)F;
+    for (int k = 0; k < F; ++k) {
+        // t reaches exactly 1 on the LAST frame: buf[L-1] must be the pre-roll
+        // frame itself, or the residue is a corner at the wrap (measured: 4x)
+        const float t = ((float)k + 1.0f) * inv;
+        const float sm = t * t * (3.0f - 2.0f * t);                  // smoothstep
+        const float gIn  = m * sm + (1.0f - m) * sinHalfPi(sm);          // toward the pre-roll
+        const float gOut = m * (1.0f - sm) + (1.0f - m) * sinHalfPi(1.0f - sm);
+        float *a = d + (size_t)(L - F + k) * nc;
+        const float *b = mPre + (size_t)((oldest + k) & (kPreRoll - 1)) * kMaxCh;
+        for (int c = 0; c < nc; ++c) a[c] = a[c] * gOut + b[c] * gIn;
+    }
+}
+
 // A clocked close: the loop is EXACTLY mWrite frames (the clock's length),
 // playback starts now, and the next kSeam input frames are still captured
 // as the tail (mTailLeft) so the seam can be blended without shortening.
-void Noether::closeLoopExact()
+void Noether::closeLoopExact(bool firstTake)
 {
     od::Sample *s = mpSample;
     if (!s || !s->mpData || mCap <= 0) { enterEmpty(); return; }
+    // 0.8.6: with enough pre-roll the seam lives at the END of the loop and
+    // needs nothing recorded after it — exact length, no tail, no clamp
+    // (a first take only: an extension's head has been overdubbed since)
+    if (firstTake) {
+        int len = mWrite;
+        if (len > mCap) len = mCap;
+        int F = kSeamClocked;
+        if (F > (len >> 1)) F = len >> 1;
+        if (F > mPreCount) F = mPreCount;
+        if (len >= 4 && F >= kPreMin) {
+            mLoopLen = len;
+            mSeamLen = F;
+            preRollSeam(s->mpData, len, F);
+            mSeamPre = 1;
+            mTailLeft = 0;
+            mFirstTake = false;
+            mRead = 0.0;
+            mJumpCount = 0;
+            ++mLoopRev;
+            markDirty(s);
+            return;
+        }
+    }
+    mSeamPre = 0;
+    // no pre-roll (a take started within kPreMin of the buffer appearing):
+    // the 0.8.5 head blend with a deferred tail
     int len = mWrite;
-    if (len > mCap - kSeam - 1) len = mCap - kSeam - 1;
+    if (len > mCap - kSeamClocked - 1) len = mCap - kSeamClocked - 1;
     if (len < 4) { enterEmpty(); return; }
+    // the clocked crossfade, at most half the loop (short loops at fast clocks)
+    mSeamLen = kSeamClocked;
+    if (mSeamLen > (len >> 1)) mSeamLen = len >> 1;
     mLoopLen = len;
     // The tail is buf[len .. len+kSeam). Normally none of it exists yet
     // (mWrite == len). If the clamp above shortened the loop, part or all of
     // it was already recorded: capture only the rest, contiguously, or blend
     // now — a tail that can never finish would leave the seam unblended and
     // mFirstTake (no undo) set forever.
-    int tail = len + kSeam - mWrite;
-    if (tail > kSeam) tail = kSeam;
-    mFirstTake = true;
+    int tail = len + mSeamLen - mWrite;
+    if (tail > mSeamLen) tail = mSeamLen;
+    mFirstTake = firstTake;              // an extension's seam blend is undoable (cow)
     if (tail <= 0) {
-        blendSeam(s->mpData, len);
+        blendSeam(s->mpData, len, mSeamLen);
         mFirstTake = false;
         mTailLeft = 0;
     } else {
@@ -436,7 +695,7 @@ void Noether::closeLoopExact()
     mRead = 0.0;
     mJumpCount = 0;
     ++mLoopRev;
-    s->setDirty();
+    markDirty(s);
 }
 
 // Least-squared-difference match of buf[L..L+kMatchWin) against the head
@@ -465,8 +724,7 @@ int Noether::findSeam(const float *d, int hi) const
     const int dn = kMatchDec * nc;
 
     // coarse errors, index i <-> L = hi - 8 i
-    constexpr int kMaxN = kSeamSearch / 8 + 1;
-    float ce[kMaxN];
+    float *ce = mSeamErr;              // a member: 1 KB off the 2 KB audio stack
     const int kN = (hi - lo) / 8 + 1;
     int   bestI = 0;
     float bestE = 3.0e38f;
@@ -570,7 +828,7 @@ void Noether::dubWrite(float *d, double pos, int L, float xl, float xr, float so
 // A jump of the read head: the new position ramps in over kJumpIn while a
 // shadow head (absolute loop position) keeps playing the old material and
 // tails out over kJumpOut (capped at half the loop for very short loops).
-void Noether::beginJump(double toWindowPhase, double shadowAbs)
+void Noether::beginJump(double toWindowPhase, double shadowAbs, int inFrames)
 {
     mWValid = false;
     mShadow = shadowAbs;
@@ -578,7 +836,7 @@ void Noether::beginJump(double toWindowPhase, double shadowAbs)
     int out = kJumpOut;
     if (mLoopLen > 0 && out > mLoopLen / 2) out = mLoopLen / 2;
     if (out < kJumpIn) out = kJumpIn;
-    int in = kJumpIn;
+    int in = inFrames < 1 ? 1 : inFrames;
     if (in > out) in = out;
     mJumpCount = out;
     mOutPh = 0.0f; mOutStep = (float)kJump / (float)out;
@@ -587,9 +845,18 @@ void Noether::beginJump(double toWindowPhase, double shadowAbs)
 
 // End of an EXTEND: the write head is the new end of the loop. Same seam
 // treatment as a first take (match + blend into the head).
+// The head moves at this close: during EXTEND the loop is heard one cycle
+// back (frame mWrite - L0), after it playback starts at the new seam. Until
+// 0.8.4 that was a hard cut (host `close`: 316x the curvature a smooth sum
+// can have); now it is the jump machinery with a symmetric 8 ms crossfade
+// from where the head was to the new seam.
 void Noether::closeExtend()
 {
+    const bool wasExtend = mState == EXTEND;
+    const double from = (double)(mWrite - mLoop0);
     closeLoop();
+    if (wasExtend && mState == EXTEND && mLoopLen > 0 && from >= 0.0 && from < (double)mLoopLen)
+        beginJump(0.0, from, kJumpOut);   // nothing to keep sharp here: a plain 8 ms crossfade
     if (mState == EXTEND) { mState = PLAY; mRecGoal = 0.0f; mRecLvl = 0.0f; }
     mUndoLenB = mLoopLen;
     mUndoAvail = true;
@@ -649,7 +916,13 @@ void Noether::process()
         mCurrentIndex = 0;
         return;
     }
-    if (mClearRequested) { mClearRequested = false; enterEmpty(); }
+    // CLEAR: a loop that can be heard fades out (5 ms) before EMPTY; until
+    // 0.8.5 it stopped dead — a click whenever it was not silent.
+    if (mClearRequested) {
+        mClearRequested = false;
+        if (mState == PLAY || mState == OVERDUB || mState == EXTEND) { mClearing = true; mClearK = 0; }
+        else enterEmpty();
+    }
     if (mLoopLen > mCap) mLoopLen = mCap;   // buffer shrank under us
 
     // ── block constants (standard §5c) ──
@@ -683,7 +956,7 @@ void Noether::process()
     const float level  = clampf(sanitize(mLevelIn.buffer()[0]), 0.0f, 1.0f);
     const bool  extend = sanitize(mExtIn.buffer()[0]) > 0.5f;
     {
-        const float b = clampf(sanitize(mBarsIn.buffer()[0]), 0.0f, 999.0f);
+        const float b = clampf(sanitize(mBarsIn.buffer()[0]), 0.0f, (float)kBarsMax);
         mBars = (int)(b + 0.5f);
     }
     const bool  stopGate = sanitize(mStopIn.buffer()[0]) > 0.5f;
@@ -692,6 +965,15 @@ void Noether::process()
     const bool  syncMode = mSyncOpt.value() == 2;
     const bool  clockPresent = mClkSince < kClkTimeout;
     if (!clockPresent) mArmed = 0;    // the clock went away: never a dead REC button
+    // and the sync overdub / extend arms (0.8.10) resolve at once the same way
+    const bool dubSync = syncMode && clockPresent && mSyncN > 0;
+    if (!dubSync) {
+        if (mDubArm == 1 && mState == PLAY) { beginPass(); mState = OVERDUB; mRecGoal = 1.0f; }
+        else if (mDubArm == 2 && mState == OVERDUB) mRecGoal = 0.0f;
+        mDubArm = 0; mDubLeft = 0; mDubTotal = 0;
+        if (mExtArm && mState == EXTEND) closeExtend();
+        mExtArm = false;
+    }
     const float playStep = mRecStep;   // 5 ms, same ramp as record
     const float aGlide = mGlideA;
     const float recStep = mRecStep;
@@ -718,7 +1000,56 @@ void Noether::process()
     mDryZ = flushTiny(mDryZ); mRecLvl = flushTiny(mRecLvl);
     if (!(mWPos >= 0.0 && mWPos < (double)(mLoopLen > 0 ? mLoopLen : 1))) mWValid = false;
 
-    float prevRec = mPrevRec, prevUndo = mPrevUndo, prevClk = mPrevClk;
+    float prevRec = mPrevRec, prevUndo = mPrevUndo, prevClk = mPrevClk, prevDub = mPrevDub;
+    const float *dubIn = mDubIn.buffer();
+    // STOP during a take (0.8.14): it ends the take the way a REC press
+    // would — free at once, sync on the next edge, so the loop keeps a whole
+    // number of pulses — and the loop lands held, ready to start from the
+    // stop button. Until 0.8.13 a stop while recording did nothing to the
+    // take: it kept recording, and the loop it later closed into was silent
+    // and frozen (Nick: "it kind of holds"). A waiting take or dub is
+    // cancelled; a running dub punches out.
+    if (stopGate && !mPrevStop && !mClearing) {
+        switch (mState) {
+        case EMPTY:   mArmed = 0; break;
+        case RECORD:
+            if (syncMode && clockPresent) { mArmed = 2; break; }
+            mArmed = 0;
+            mWrite = (mWrite < 1) ? 1 : mWrite;
+            mSyncN = 0;
+            closeLoop(true);
+            if (mState == RECORD) enterPlay();
+            break;
+        case PLAY:    mDubArm = 0; mDubLeft = 0; mDubTotal = 0; break;
+        case OVERDUB: mRecGoal = 0.0f; mDubArm = 0; mDubLeft = 0; mDubTotal = 0; break;
+        case EXTEND:
+            if (syncMode && clockPresent) mExtArm = true;
+            else closeExtend();
+            break;
+        default: break;
+        }
+    }
+    // STOP RELEASED in sync (0.8.14): the loop comes back in where the
+    // clock is — the head the downbeat re-sync would have carried there —
+    // not where it stopped. It used to resume in place, out of time, until
+    // the next downbeat jumped it. It is silent at this moment (held), so
+    // no crossfade: the 5 ms transport ramp brings it in.
+    if (!stopGate && mPrevStop && syncMode && clockPresent && mSyncN > 0 && mLoopLen > 0 &&
+        (mState == PLAY || mState == OVERDUB) && mPlayLvl <= 0.0f) {
+        const double L = (double)mLoopLen;
+        double frac = mClkPeriod > 0 ? (double)mClkSince / (double)mClkPeriod : 0.0;
+        if (frac > 1.0) frac = 1.0;
+        double pos = (double)mSpeedZ * ((double)mEdgePhase + frac) * L / (double)mSyncN;
+        // |speed| <= 2 and phase <= N + 1 pulses: within a few loops, so a
+        // bounded wrap (no fmod — libm on the audio thread)
+        for (int k = 0; k < 4 && pos >= L; ++k) pos -= L;
+        for (int k = 0; k < 4 && pos < 0.0; ++k) pos += L;
+        if (!(pos >= 0.0 && pos < L)) pos = 0.0;
+        mRead = pos;
+        mJumpCount = 0;
+        mWValid = false;
+    }
+    mPrevStop = stopGate;
     mStopped = stopGate;
     if (mRestoring) restoreSome(d);
 
@@ -729,6 +1060,9 @@ void Noether::process()
         // ── REC edge: the whole pedal grammar on one button ──
         const float r = rec[i];
         if (r > 0.5f && prevRec <= 0.5f) {
+            // a REC press during the clear's 21 ms fade is a press on an EMPTY
+            // loop (finish the clear now) — never an overdub the clear discards
+            if (mClearing) { mClearing = false; enterEmpty(); }
             switch (mState) {
             case EMPTY:   if (syncMode && clockPresent) { mArmed = 1; mClkAtStart = mClkCount; }
                           else { mArmed = 0; enterRecord(); }
@@ -737,16 +1071,53 @@ void Noether::process()
                           mArmed = 0;
                           mWrite = (mWrite < 1) ? 1 : mWrite;  // at least one frame
                           mSyncN = 0;
-                          closeLoop();
+                          closeLoop(true);
                           if (mState == RECORD) enterPlay();
                           break;
-            case PLAY:    if (!mRestoring && !(mStopped && mPlayLvl <= 0.0f)) { beginPass(); mState = OVERDUB; mRecGoal = 1.0f; } break;
-            case OVERDUB: mRecGoal = 0.0f; break;   // ramp out, then PLAY
-            case EXTEND:  closeExtend(); break;
+            case PLAY:
+                if (mRestoring || (mStopped && mPlayLvl <= 0.0f)) break;
+                // sync mode (0.8.10): an overdub is a clocked take — armed
+                // here, in on the next bar line; pressing again while armed
+                // cancels. Free mode: in at once.
+                if (dubSync) mDubArm = (mDubArm == 1) ? 0 : 1;
+                else { beginPass(); mState = OVERDUB; mRecGoal = 1.0f; }
+                break;
+            case OVERDUB:
+                if (dubSync) mDubArm = 2;                  // out on the next bar line
+                else mRecGoal = 0.0f;                      // ramp out, then PLAY
+                break;
+            case EXTEND:
+                if (syncMode && clockPresent) mExtArm = true;   // close on the next bar line
+                else closeExtend();
+                break;
             case STOP:    break;
             }
         }
         prevRec = r;
+        // ── DUB edge (0.8.10): the unsynced overdub — in / out at THIS sample
+        //    whatever the sync mode; a waiting bar-line overdub starts now, a
+        //    counted one stops now; with no loop there is nothing to dub ──
+        {
+            const float g = sanitize(dubIn[i]);
+            if (g > 0.5f && prevDub <= 0.5f && !mClearing) {
+                switch (mState) {
+                case PLAY:
+                    if (mRestoring || (mStopped && mPlayLvl <= 0.0f)) break;
+                    beginPass(); mState = OVERDUB; mRecGoal = 1.0f;
+                    mDubArm = 0; mDubLeft = 0; mDubTotal = 0;
+                    break;
+                case OVERDUB:
+                    mRecGoal = 0.0f; mDubArm = 0; mDubLeft = 0; mDubTotal = 0;
+                    break;
+                case EXTEND:                              // closes as rec does
+                    if (syncMode && clockPresent) mExtArm = true;
+                    else closeExtend();
+                    break;
+                default: break;                           // EMPTY / RECORD / STOP
+                }
+            }
+            prevDub = g;
+        }
         // ── CLOCK edge ──
         const float ce = clk[i];
         if (ce > 0.5f && prevClk <= 0.5f) onClockEdge();
@@ -763,6 +1134,11 @@ void Noether::process()
         if (mStopped) { if (mPlayLvl > 0.0f) { mPlayLvl -= playStep; if (mPlayLvl < 0.0f) mPlayLvl = 0.0f; } }
         else          { if (mPlayLvl < 1.0f) { mPlayLvl += playStep; if (mPlayLvl > 1.0f) mPlayLvl = 1.0f; } }
         const bool held = mStopped && mPlayLvl <= 0.0f;
+        float clearGain = 1.0f;
+        if (mClearing) {
+            if (mClearK >= kHandover) { mClearing = false; enterEmpty(); }
+            else clearGain = mXfade[mClearK++];   // falling smoothstep, 21 ms
+        }
 
         // ── record level ramp ──
         if (mRecLvl < mRecGoal) { mRecLvl += recStep; if (mRecLvl > mRecGoal) mRecLvl = mRecGoal; }
@@ -782,10 +1158,16 @@ void Noether::process()
 
         float yl = 0.0f, yr = 0.0f;   // loop output
         switch (mState) {
-        case EMPTY:
+        case EMPTY: {
+            // the pre-roll ring: what preceded the next take (0.8.6)
+            float *pr = mPre + (size_t)mPrePos * kMaxCh;
+            pr[0] = xl; pr[1] = xr;
+            mPrePos = (mPrePos + 1) & (kPreRoll - 1);
+            if (mPreCount < kPreRoll) ++mPreCount;
             mDryZ += aDry * (1.0f - mDryZ);
             outL[i] = xl * mDryZ; outR[i] = xr * mDryZ;
             continue;
+        }
 
         case RECORD: {
             float *w = d + (size_t)mWrite * mNc;
@@ -796,7 +1178,7 @@ void Noether::process()
                 // the buffer is full: a free close, whatever the clock was
                 // doing — not a whole number of periods, so no N and no arm
                 mArmed = 0; mSyncN = 0;
-                closeLoop(); if (mState == RECORD) enterPlay();
+                closeLoop(true); if (mState == RECORD) enterPlay();
             }
             mDryZ += aDry * (1.0f - mDryZ);
             outL[i] = xl * mDryZ; outR[i] = xr * mDryZ;   // monitor the take
@@ -819,7 +1201,10 @@ void Noether::process()
             if (mWrite >= mCap) closeExtend();
             yl = sl; yr = sr;
             mDryZ += aDry * (1.0f - mDryZ);
-            yl *= level; yr *= level;
+            // the stop fade applies here too: a sync extension stopped mid-bar
+            // records on to the bar line, and the loop must not step to
+            // silence when it closes held
+            yl *= level * mPlayLvl * clearGain; yr *= level * mPlayLvl * clearGain;
             outL[i] = xl * mDryZ + yl;
             outR[i] = xr * mDryZ + yr;
             continue;
@@ -835,7 +1220,7 @@ void Noether::process()
                 w[0] = xl;
                 if (mNc > 1) w[1] = xr;
                 ++mWrite;
-                if (--mTailLeft == 0) { blendSeam(d, L); mFirstTake = false; ++mLoopRev; }
+                if (--mTailLeft == 0) { blendSeam(d, L, mSeamLen); mFirstTake = false; ++mLoopRev; }
             }
             // absolute loop position of the read head
             double pos = mRead;
@@ -897,6 +1282,7 @@ void Noether::process()
                 // at forward speed and keeps recording
                 if (fwd && mState == OVERDUB && extend && mRecGoal > 0.0f) {
                     mLoop0 = L;
+                    mExtEdges = 0; mExtBeat = 0; mExtArm = false;
                     mWrite = L;
                     if (mWrite < mCap) { mState = EXTEND; ++mLoopRev; break; }
                 }
@@ -917,14 +1303,45 @@ void Noether::process()
         // pedal-looper style. The dry gain glides so a state change never
         // steps the dry signal.
         const float dryT = (mState == OVERDUB) ? 1.0f : dry;
-        mDryZ += aDry * (dryT - mDryZ);
-        yl *= level * mPlayLvl; yr *= level * mPlayLvl;
+        float handGain = 1.0f;
+        if (mHandover > 0) {
+            // the close's handover: the loop rises and the dry level (forced
+            // to 1 while recording) settles to Dry along the SAME smoothstep
+            const float xf = mXfade[kHandover - mHandover];   // 1 -> 0
+            handGain = 1.0f - xf;
+            mDryZ = dryT + (mDryZ > dryT ? (1.0f - dryT) : 0.0f) * xf;
+            if (!(mDryZ >= 0.0f && mDryZ <= 1.0f)) mDryZ = dryT;
+            --mHandover;
+        } else {
+            mDryZ += aDry * (dryT - mDryZ);
+        }
+        yl *= level * mPlayLvl * clearGain * handGain; yr *= level * mPlayLvl * clearGain * handGain;
         outL[i] = xl * mDryZ + yl;
         outR[i] = xr * mDryZ + yr;
     }
-    mPrevRec = prevRec; mPrevUndo = prevUndo; mPrevClk = prevClk;
+    mPrevRec = prevRec; mPrevUndo = prevUndo; mPrevClk = prevClk; mPrevDub = prevDub;
 
-    if (mState == RECORD || mState == OVERDUB || mState == EXTEND) s->setDirty();
+    // ZERO after a clear, a slice per block, never under the write head: in
+    // EMPTY from the start, in RECORD (a new take began) only ahead of it;
+    // anything else (the take already closed) ends the pass.
+    if (mZeroRequested && !mClearing && (mState == EMPTY || mState == RECORD)) {
+        mZeroRequested = false; mZeroing = true; mZeroPos = 0;
+    }
+    if (mZeroing) {
+        if (mState == EMPTY || mState == RECORD) {
+            int from = mZeroPos;
+            if (mState == RECORD && from < mWrite + 1) from = mWrite + 1;
+            int to = from + kZeroPerBlock;
+            if (to > mCap) to = mCap;
+            if (from < to) memset(d + (size_t)from * mNc, 0, (size_t)(to - from) * mNc * sizeof(float));
+            mZeroPos = to > from ? to : from;
+            if (mZeroPos >= mCap) mZeroing = false;
+            markDirty(s);
+        } else {
+            mZeroing = false;
+        }
+    }
+    if (mState == RECORD || mState == OVERDUB || mState == EXTEND) markDirty(s);
     mCurrentIndex = (mState == RECORD || mState == EXTEND) ? mWrite : mVizPos;
 }
 

@@ -4,7 +4,145 @@ What changed for players, version by version, from 0.3.0 (the first build
 with the Reel) to the current release. The engineering detail behind each
 entry lives in `memory.md`.
 
-## 0.8.3 — current
+## 0.8.14 — current
+
+- **Stop ends a take.** Pressing stop while recording used to do nothing to
+  the recording: it kept going, and the loop it eventually closed into was
+  silent and stuck. Now stop closes the take the way REC would: at once in
+  free mode, on the next clock pulse in sync mode (so the loop stays a whole
+  number of pulses). The loop waits, stopped; release stop to play it. Stop
+  also ends an extension the same way, punches out a running overdub, and
+  cancels a take or overdub that is waiting for the clock.
+- **Stop in sync mode comes back in time.** Releasing stop now brings the
+  loop back where the clock is, as if it had kept playing silently. Before,
+  it resumed from where it stopped, out of time, until the next downbeat
+  jumped it into place.
+- **The bar readout follows the loop you hear.** It counted clock pulses, so
+  it was right only at 1x: at half speed it showed bar 2 while you only ever
+  heard bar 1. Now it reads the play head at any speed. While stopped it
+  shows where the loop will come back in. During an extension it counts the
+  bar being added (it used to freeze). A loop that doesn't end on a bar line
+  now reads "beat 3/7" instead of calling its beats bars.
+
+## 0.8.13
+
+- **Fixes 0.8.10 breaking the ER-301's audio after a recording.** With
+  0.8.10, closing a loop could overflow the small memory area (stack) the
+  ER-301's audio thread works in. That corrupted memory beside it, and all
+  audio stayed harshly distorted until a reboot, even with Noether bypassed.
+  Noether's seam search kept a 1 KB list of measurements there, which had
+  only just fitted since 0.7.1. It now lives inside Noether's own memory.
+  The build now measures every audio function's stack use and refuses to
+  package anything that could do this again.
+- **Bars now goes up to 16** (it was 64), on the dial and by CV. More than
+  16 bars wasn't musically manageable.
+- Includes everything from 0.8.10: sync overdubs as clocked takes, extend
+  following the clock, and the dub button. (0.8.11 and 0.8.12 were
+  diagnostic builds, not releases.)
+
+## 0.8.10 (do not use: see 0.8.13)
+
+- **In sync mode, an overdub is another clocked take.** Press **rec** while
+  the loop plays and the overdub waits for the next bar line, then punches
+  in. With **Bars** set, it runs exactly that many bars and punches out by
+  itself on a bar line. With Bars at 0, a second press punches out at the
+  next bar line. Pressing again while it's waiting cancels it. The reel
+  flashes **DUB** while it waits, and shows the bar count ("2/4") while a
+  counted overdub runs. Free mode still punches in and out the moment you
+  press.
+- **New dub button: overdub right now.** Next to rec, **dub** punches an
+  overdub in or out the moment you press it, in sync mode or not, and
+  ignores Bars. So in sync mode you have both: rec for an overdub on the
+  bar, dub for one on the spot. Dub also starts an overdub that rec has set
+  waiting, and stops a counted one early. It does nothing when there's no
+  loop yet. Like rec, it takes a gate or trigger from anywhere.
+- **Extend keeps the loop in time with the clock.** In sync mode an
+  extension now closes on a clock pulse (at the next bar line after you
+  press rec, or by itself after Bars bars). The loop's bar count grows with
+  it, so the bar readout and the re-sync follow the new length. Before, the
+  re-sync kept using the old length and pulled the longer loop back to its
+  start.
+
+## 0.8.9
+
+- **Bars counts bars.** A new menu list, **Clock pulses per bar** (1, 2, 3, 4,
+  6, 8, 12, 16, 24 or 96), tells Noether how many clock pulses make one bar.
+  Set it to 16 for a 16th-note clock, 4 for quarter notes, 96 for a 24 PPQN
+  clock, or 3, 6 or 12 for 3/4 and 6/8 time. Then **Bars 4** records four
+  real bars. The readouts count bars with the beat after them ("bar 2/4 .3"),
+  and the reel's ticks mark bars. The default of 1 works exactly as before,
+  and the setting is saved with the preset.
+
+## 0.8.8
+
+- **Quicksaves no longer ask you to save Noether's buffer.** Noether saves
+  its loop to the card by itself, so its own buffers (the loop buffer and
+  the undo buffer) now count as saved, and the "unsaved audio buffers"
+  question doesn't come up because of them. A buffer you attach yourself
+  from the sample pool is still treated as yours, and you'll still be asked
+  about it.
+
+## 0.8.7
+
+- **A quicksaved loop plays again after a reboot, even if you also saved the
+  buffer.** When the quicksave asks to save Noether's buffer and you say
+  yes, after a reboot that buffer is loaded back from the card while Noether
+  loads its own loop file beside it. Noether used to copy its loop in
+  before the buffer had finished loading, and the loop was lost: the audio
+  showed on screen, but nothing played. Noether now waits for both files.
+  If its loop file is missing but the saved buffer is there, it plays the
+  loop from the buffer.
+
+## 0.8.6
+
+- **The start of a loop is never altered.** To join a loop's end smoothly
+  to its start, Noether used to blend the end *into the first moments of
+  the loop*: 2.7 ms in free mode, 21 ms in sync mode (0.8.5). On sequenced
+  or plucked material that softened the first note of every pass. Noether
+  now keeps the few milliseconds of sound from just before you started
+  recording, and blends the loop's *end* into that. The loop ends the way
+  the original sound led into its first note, and that first note plays
+  exactly as recorded, in free and sync mode.
+- **The join adapts to the material.** Similar sound on both sides gets
+  one crossfade shape; unrelated sound gets another that keeps the level
+  steady instead of dipping.
+- A sync loop that ends right at the end of the buffer now keeps its exact
+  bar length.
+
+## 0.8.5
+
+- **No pop when you stop recording**, free or clocked. When a take closes,
+  what you hear switches from the live input to the loop, and the two are
+  usually out of phase. 0.8.4 made that switch over 5 ms, which on low
+  notes is shorter than one cycle and comes out as a thump. It now takes
+  21 ms along a smooth curve, and the Dry level follows the same curve.
+- Pressing rec while a clear is still fading out starts a new take, as it
+  should, instead of being swallowed.
+- **Clocked loops no longer pop on every pass.** A clocked loop's length is
+  set by the clock, so a held tone usually doesn't fit it exactly, and the
+  end of the loop meets its start out of phase. That join was smoothed over
+  2.7 ms, which on a pure tone is a pop every time the loop goes round. It
+  is now smoothed over 21 ms. On a pure tone that lands exactly opposite in
+  phase you may hear a short soft dip instead; on real material it's much
+  milder. Free loops are unchanged: they still pick an in-phase cut.
+- **Clear loop no longer clicks.** The loop now fades out over 5 ms instead
+  of stopping dead. The buffer is then silenced a small piece at a time
+  (about a second for 30 s) instead of all at once while the audio runs,
+  which could cause a dropout in a busy patch.
+
+## 0.8.4
+
+- **No click when you close the first take.** While you record, you hear
+  only your input. When you pressed rec to close, the loop started playing
+  at full level from its first sample, and unless the input was silent at
+  that moment the output jumped: a click. The loop now fades in over 5 ms
+  (the same fade as Stop). This also covers clocked closes, a take that
+  fills the buffer, and a loop restored from a preset.
+- **No click when you end an Extend.** During an Extend you hear the loop
+  one cycle back; when it closed, playback cut straight to the new start.
+  It now crossfades over 8 ms.
+
+## 0.8.3
 
 - **What you hear while overdubbing is clean.** The overdub used to write at
   the play head and then read that spot straight back. So while DUB was on,

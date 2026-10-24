@@ -214,6 +214,38 @@ acceptable **only** when every buffer is pre-allocated and every index stays
 in range, so the worst case is a moment of mixed content rather than a fault.
 Which leads directly to:
 
+## 2a. The audio thread has a 2 KB stack
+
+`process()` runs on a task whose whole stack is **2048 bytes**, shared with
+the firmware's own frames above yours. A local array that is ordinary
+anywhere else is a crash here.
+
+> Noether's seam search kept a 1 KB array of match errors as a local — on
+> the audio thread, at every loop close. It fit for eleven versions. Then an
+> unrelated change moved the compiler's inlining a few bytes, and the first
+> recording overflowed the stack. To the ear: ALL audio on the ER-301
+> harshly distorted until a reboot, with the unit bypassed — the overflow
+> had written over the memory beside that stack. The stolmine crash
+> diagnostics named it: `Kind: data-abort *** STACK BLOWN ***`,
+> `size=2048 used=2048 (100%) canary=BLOWN`. Every host test passed; host
+> stacks are megabytes.
+
+The rules:
+
+- **No large locals in anything `process()` calls.** Scratch arrays are
+  members, sized once (§3). A few hundred bytes for the deepest audio path
+  is the budget; the firmware needs the rest.
+- **Measure, do not estimate.** Compile the engine with `-fstack-usage` (it
+  only writes a report — the code is identical) and gate the package on it:
+  `tools/check-stack.sh <limit> obj/Engine.su` fails on any frame over the
+  limit (512 bytes by default; tighter is better) or any dynamic frame
+  (alloca, a variable-length array). It is mirrored alongside this file.
+- **A bug that appears when you remove *either* of two unrelated changes is
+  a size or layout threshold, not a logic bug in either.** Look at stacks,
+  alignment and memory, not at the features.
+- Code that runs only on the Lua thread (`setSample`, menu Tasks, table
+  builders) has a 32 KB stack; the limit is about the audio path.
+
 ## 3. Allocate once, for the worst case
 
 Never resize a buffer the audio thread might be reading — that is a
@@ -671,6 +703,7 @@ can be looked up rather than rediscovered.
 | High CPU that scales with nothing musical | Display recomputed every block | §5b |
 | A control exists but cannot be patched | Branch with no view control | §1 |
 | A test passes on a case that is visibly broken | Probe point where the function is stationary | §6 |
+| ALL audio distorted until a reboot, the unit bypassed; crash report "STACK BLOWN" | A large local on the audio thread's 2 KB stack | §2a |
 
 ## §12 — Attaching a sample: what the firmware actually guarantees
 

@@ -161,7 +161,16 @@ public:
         if (locked) { fb.circle(WHITE, hx, hy, 3); fb.pixel(WHITE, hx, hy); }
         else        { fb.fillCircle(WHITE, hx, hy, 2); }
 
-        if (state == Noether::OVERDUB) centerWord(fb, WHITE, cx, cy, "DUB", 10);
+        // 0.8.10: a sync overdub — armed (in or out) the word blinks; a
+        // counted one shows its bar, as a counted take does
+        const int dubArm = h->getDubArmed();
+        const bool dubBlink = (mFrame >> 3) & 1;
+        if (state == Noether::OVERDUB && h->getDubBars() > 0 && dubArm == 0) {
+            snprintf(mBarBuf, sizeof mBarBuf, "%d/%d", h->getDubBar(), h->getDubBars());
+            centerWord(fb, WHITE, cx, cy, mBarBuf, 10);
+        }
+        else if (state == Noether::OVERDUB) { if (dubArm != 2 || dubBlink) centerWord(fb, WHITE, cx, cy, "DUB", 10); }
+        else if (dubArm == 1 && state == Noether::PLAY) { if (dubBlink) centerWord(fb, WHITE, cx, cy, "DUB", 10); }
         else if (state == Noether::STOP) centerWord(fb, GRAY9, cx, cy, "STOP", 10);
         else if (h->isRestoring())      centerWord(fb, WHITE, cx, cy, "undo", 10);
         else if (h->canUndo())          centerWord(fb, GRAY5, cx, cy, "undo", 8);

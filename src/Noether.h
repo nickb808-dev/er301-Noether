@@ -81,9 +81,11 @@ public:
     // flag that process() honours at the next block).
     void clearLoop();
     // Menu Task, after clearLoop(): silence the buffer so the waveform view
-    // shows nothing — the stock loopers' zeroBuffer (RecordHead::zeroBuffer,
-    // od::Sample::zero from the Lua thread; the audio thread has already
-    // left the buffer alone by the time the task runs).
+    // shows nothing. Since 0.8.5 this only REQUESTS it: the audio thread
+    // zeroes kZeroPerBlock frames a block once the loop has faded out. Until
+    // then the Lua thread did od::Sample::zero() — one 5.7 MB memset (30 s
+    // stereo) while the audio ran, and the tester heard a click on clear in
+    // a busy patch (75 % CPU) but not with Noether alone.
     void zeroBuffer();
     // 0 EMPTY · 1 RECORD · 2 PLAY · 3 OVERDUB · 4 STOP — for the display.
     int   getState();
@@ -104,6 +106,16 @@ public:
     // reason code (see Noether.cpp).
     int  exportLoop(od::Sample *dst);
     int  importLoop(od::Sample *src);
+    // UI thread (0.8.7): play the first `frames` of what is ALREADY in the
+    // buffer as the loop — for a buffer the player saved to the card at
+    // quicksave time and that came back from that file. Returns the loop
+    // length, -2 no buffer, -4 too short, -5 the buffer is still loading.
+    int  playBuffer(int frames);
+    // 1 (default): never mark the loop buffer "unsaved" — Noether saves its
+    // loop itself, so its own buffers need not make every quicksave ask to
+    // save them (Nick, 2026-10-23). 0 for a buffer the player attached from
+    // the pool: that one is theirs, and the normal prompt protects it.
+    void setKeepClean(int on);
     // Bumps whenever the loop's content or length changes (close, overdub
     // out, extend, clear, import), so Lua saves only what changed.
     int  getLoopRev();
@@ -135,6 +147,23 @@ public:
     // Both 0 when there is nothing to count.
     int  getBar();
     int  getBars();
+    int  getBarsWhole();   // 1 when the bar readout counts bars, 0 when it counts pulses ("beat")
+    // Pulses per bar (0.8.9, menu): the clock's resolution, so Bars counts
+    // BARS — a counted take is bars x pulses-per-bar clock pulses. 1 (the
+    // default) is the old behaviour exactly. Clamped 1..96. The bar readouts
+    // divide by it; the downbeat re-sync keeps the exact pulse count.
+    void setPulsesPerBar(int n);
+    int  getPulsesPerBar();
+    // The pulse within the current bar, 1-based, when pulses per bar > 1 and
+    // a bar count is shown; else 0. For the display.
+    int  getBeat();
+    // Sync-mode overdub (0.8.10): 1 = armed to punch in at the next bar line,
+    // 2 = armed to punch out at the next bar line, 0 = not armed.
+    int  getDubArmed();
+    // A counted overdub (Bars > 0): the bar it is in (1-based) and its length
+    // in bars; both 0 when no counted overdub runs. For the display.
+    int  getDubBar();
+    int  getDubBars();
 
 #ifndef SWIGLUA
     void process() override;
@@ -145,6 +174,7 @@ public:
     od::Outlet mRightOut {"Right Out"};
 
     od::Inlet  mRecIn    {"Rec"};      // trigger: the one-button pedal grammar
+    od::Inlet  mDubIn    {"Dub"};      // trigger (0.8.10): overdub in / out NOW, sync or not
     od::Inlet  mStopIn   {"Stop"};     // latched gate: high = stop (level fades, head holds)
     od::Inlet  mUndoIn   {"Undo"};     // trigger: swap the last pass out / back in
     od::Inlet  mClkIn    {"Clk"};      // trigger: free mode = restart the loop; sync mode = the clock
@@ -165,18 +195,41 @@ public:
     int  vizPos()     const { return mVizPos; }
     int  vizLoop0()   const { return mLoop0; }        // loop length an EXTEND started from
     int  vizCapacity() const { return mCap; }
+    int  vizZeroed()   const { return mZeroPos; }        // zeroed up to here (rises during a clear)
+    float seamRho()    const { return mSeamRho; }
+    int  seamUsedPreRoll() const { return mSeamPre; }
     float vizSpeedTarget() const { return mSpeedT; }  // detented, pre-glide
 
     static constexpr int   kSections    = 8;
+    static constexpr int   kBarsMax     = 16;   // the Bars dial's top, and CV's (0.8.13: was 64 / 999)
     static constexpr int   kClkTimeout  = 4 * 48000;   // no edge for 4 s = no clock
     static constexpr int   kClkMinPeriod = 960;        // 20 ms: faster edges are noise
     static constexpr int   kSyncTol     = 64;          // head within this of the seam: no re-sync jump
     static constexpr int   kUndoMaxSecs = 60;     // bitmap sized once for the largest buffer
     static constexpr int   kRestorePerBlock = 2048; // frames swapped per block during undo
+    static constexpr int   kZeroPerBlock = 4096;    // frames zeroed per block after a clear (30 s: ~1 s)
     static constexpr float kDetentPct   = 0.03f;  // +/-3 % magnetic window
     static constexpr float kDetentZero  = 0.03f;  // absolute window around 0
 
-    static constexpr int   kSeam        = 128;   // seam blend (2.7 ms)
+    static constexpr int   kSeam        = 128;   // seam blend (2.7 ms): free closes, phase-matched
+    // A clocked close cannot move its cut (the clock sets the length), so a
+    // steady tone that does not fit the loop meets itself out of phase at the
+    // wrap, and no cut point fixes that. Over 2.7 ms that mismatch is a pop on
+    // every pass (tester, 0.8.4); over 21 ms it is a smooth transition.
+    static constexpr int   kSeamClocked = 1024;
+    // The handover when a first take closes: live input -> loop, and the
+    // clear fade-out. A smoothstep over kJump (21 ms) from mXfade. 0.8.4 used
+    // the 5 ms LINEAR transport ramp: shorter than a period of a low tone and
+    // cornered at both ends — the tester's "pop when you stop recording",
+    // free and clocked (host: 40x a smooth sum's curvature at 55 Hz).
+    static constexpr int   kHandover    = 1024;
+    // PRE-ROLL (0.8.6, after lucasowens/previously DESIGN §5.2): the input
+    // is kept in a ring while EMPTY, so a clocked close can blend the loop's
+    // END into the audio that preceded its start. The wrap then flows as the
+    // recording did, and the downbeat is never touched — 0.8.5 blended the
+    // tail INTO the head over 21 ms, softening a downbeat attack every pass.
+    static constexpr int   kPreRoll     = 1024;   // power of two (mask, no %)
+    static constexpr int   kPreMin      = 64;     // less pre-roll than this: the old head blend
     static constexpr int   kJump        = 1024;  // fade table resolution
     static constexpr int   kJumpIn      = 48;    // a jump's incoming ramp (1 ms): attacks survive
     static constexpr int   kJumpOut     = 384;   // the outgoing material's own tail (8 ms): no click
@@ -200,6 +253,14 @@ private:
 
     State mState   = EMPTY;
     bool  mClearRequested = false;
+    bool  mKeepClean = true;      // see setKeepClean
+    inline void markDirty(od::Sample *s) { if (s && !mKeepClean) s->setDirty(); }
+    bool  mClearing = false;      // the loop is fading out before EMPTY (kHandover)
+    int   mClearK = 0;            // position in that fade (mXfade index)
+    int   mHandover = 0;          // samples left in the live -> loop handover after a close
+    bool  mZeroRequested = false; // zeroBuffer() asked; starts once EMPTY
+    bool  mZeroing = false;
+    int   mZeroPos = 0;           // frames zeroed so far in this pass
     bool  mSeamMatch = true;
 
     // record head (integer, 1x forward on the first take)
@@ -239,6 +300,8 @@ private:
     float  mRecLvl = 0.0f, mRecGoal = 0.0f;
     float  mPrevRec = 0.0f;    // last Rec sample of the previous block
     float  mPrevUndo = 0.0f;
+    float  mPrevDub = 0.0f;
+    bool   mPrevStop = false;  // last block's Stop gate (a stop press ends a take, 0.8.14)
     // clock
     float  mPrevClk = 0.0f;
     int    mClkSince = 1 << 30;   // samples since the last edge (huge = none)
@@ -249,7 +312,22 @@ private:
     int    mEdgePhase = 0;        // edges since the last downbeat
     int    mArmed = 0;            // 0 none, 1 = start on next edge, 2 = stop on next edge
     int    mBars = 0;             // the Bars inlet, rounded, read once per block
+    int    mPpb = 1;              // pulses per bar (menu), 1..96
+    // sync-mode overdub / extend (0.8.10)
+    int    mDubArm = 0;           // 1 punch in at the next bar line, 2 punch out there
+    int    mDubLeft = 0;          // pulses left in a counted overdub (0 = open-ended)
+    int    mDubTotal = 0;         // that overdub's length in pulses (display)
+    int    mBeatInBar = 0;        // pulses since the last bar line of the loop (no %: a counter)
+    int    mExtEdges = 0;         // pulses since this extension began
+    int    mExtBeat = 0;          // pulses since its last bar line
+    bool   mExtArm = false;       // REC pressed during a sync extension: close at the next bar line
     int    mTailLeft = 0;         // frames of tail still to capture after a clocked close
+    int    mSeamLen = kSeam;      // that close's crossfade length (kSeamClocked, or half a short loop)
+    float  mPre[kPreRoll * kMaxCh];   // the pre-roll ring (input while EMPTY), interleaved
+    int    mPrePos = 0;           // next ring slot to write
+    int    mPreCount = 0;         // valid frames in the ring (<= kPreRoll)
+    float  mSeamRho = 1.0f;       // the last pre-roll seam's signed rho^2 (tests)
+    int    mSeamPre = 0;          // the last clocked close used the pre-roll (1) or the head blend (0)
     bool   mFirstTake = false;    // that tail's blend is not an undo-able pass
     // transport: stop gate high -> level ramps to 0 and the head holds
     bool   mStopped = false;
@@ -302,18 +380,33 @@ private:
     }
     void dubWrite(float *d, double pos, int L, float xl, float xr, float sos);
     void onClockEdge();        // audio thread, at the edge sample
-    void blendSeam(float *d, int L);
-    void closeLoopExact();     // clocked close: exact length + deferred tail
+    void blendSeam(float *d, int L, int len = kSeam);
+    void closeLoopExact(bool firstTake = true);   // clocked close: exact length (pre-roll seam on a first take)
+    int  readoutPulse();       // UI: the pulse (0..N-1) the bar readout shows, -1 none
+    void closeExtendExact();   // sync mode: an extension closes on the clock, N grows by its pulses
+    void preRollSeam(float *d, int L, int F);   // blend buf[L-F, L) toward the pre-roll
     void beginPass();          // an overdub / extend starts: new undo point
     void beginUndo();          // the Undo edge: start swapping
     void restoreSome(float *d);// per block: swap up to kRestorePerBlock frames
     void clearUndo();
     // Smoothstep seam blend of the tail into the head; shortens the loop by kSeam.
-    void closeLoop();
+    // preRoll: a FIRST take (0.8.6) — the seam goes into the pre-roll, the
+    // head untouched; an extend keeps the head blend (its head has been
+    // overdubbed since, so the pre-roll no longer precedes it)
+    void closeLoop(bool preRoll = false);
     // The phase-matched cut: the L in [hi - kSeamSearch, hi] whose following
     // kMatchWin samples best match the head (least squared difference).
     int  findSeam(const float *d, int hi) const;
-    void beginJump(double toWindowPhase, double shadowAbs);
+    // findSeam's coarse errors. A MEMBER, never a local: the audio thread's
+    // stack on the ER-301 is 2 KB (stolmine crash diagnostics, 2026-10-23:
+    // "STACK BLOWN", a 2048-byte task stack 100 % used) and this array is
+    // 1 KB — it overflowed the stack the moment a take closed (0.8.10), and
+    // the corruption distorted ALL audio until a reboot. tools/check-stack.sh
+    // now fails the build on any engine frame over the limit.
+    mutable float mSeamErr[kSeamSearch / 8 + 1];
+    // inFrames: the new position's ramp (kJumpIn for clock jumps: attacks
+    // survive; kJumpOut at an extend close: a symmetric crossfade)
+    void beginJump(double toWindowPhase, double shadowAbs, int inFrames = kJumpIn);
     void closeExtend();
     inline float readHermite(const float *d, double pos, int ch) const;
     void enterEmpty();
